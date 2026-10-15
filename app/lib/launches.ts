@@ -15,9 +15,30 @@ export type Launch = {
   last_valid: number | null; transaction: string | null; signature: string | null; error: string | null;
   setup_transaction: string | null; setup_signature: string | null;
 };
-type Runtime = { DB?: D1Database; BUCKET?: R2Bucket; SITE_OWNER_EMAIL?: string; SOLANA_RPC_URL?: string };
+type Runtime = { DB?: D1Database; BUCKET?: R2Bucket; SITE_OWNER_EMAIL?: string; SOLANA_RPC_URL?: string; STARTING_TOKEN_CA?: string };
 export type BaseToken={mint:string;name:string;symbol:string};
-export async function baseToken(){return db().prepare('SELECT mint,name,symbol FROM chain_config WHERE id=1').first<BaseToken>();}
+type Activation={status:'awaiting-ca'|'waiting-for-token'|'active'|'invalid-ca'|'verification-delayed';mint?:string};
+export async function startingToken():Promise<{base:BaseToken|null;activation:Activation}>{
+  const saved=await db().prepare('SELECT mint,name,symbol FROM chain_config WHERE id=1').first<BaseToken>();
+  if(saved)return {base:saved,activation:{status:'active',mint:saved.mint}};
+  const candidate=runtime().STARTING_TOKEN_CA?.trim();
+  if(!candidate)return {base:null,activation:{status:'awaiting-ca'}};
+  let key:PublicKey;
+  try{key=new PublicKey(candidate);}catch{return {base:null,activation:{status:'invalid-ca'}};}
+  const mint=key.toBase58();
+  try{
+    const account=await connection().getAccountInfo(bondingCurvePda(key),'finalized');
+    if(!account)return {base:null,activation:{status:'waiting-for-token',mint}};
+    if(!account.owner.equals(PUMP_PROGRAM_ID))return {base:null,activation:{status:'invalid-ca',mint}};
+    try{PUMP_SDK.decodeBondingCurve(account);}catch{return {base:null,activation:{status:'invalid-ca',mint}};}
+  }catch{return {base:null,activation:{status:'verification-delayed',mint}};}
+  // Runtime configuration is owner-controlled. Never replace an existing root or live chain.
+  await db().prepare("INSERT INTO chain_config(id,mint,name,symbol,configured_by,updated_at) SELECT 1,?,?,?,?,? WHERE NOT EXISTS(SELECT 1 FROM launches WHERE status='finalized' OR active=1) ON CONFLICT(id) DO NOTHING")
+    .bind(mint,ROOT_NAME,ROOT_SYMBOL,'owner-runtime',Date.now()).run();
+  const base=await db().prepare('SELECT mint,name,symbol FROM chain_config WHERE id=1').first<BaseToken>();
+  return {base,activation:{status:base?'active':'verification-delayed',mint:base?.mint||mint}};
+}
+export async function baseToken(){return (await startingToken()).base;}
 export async function ownerStatus(){const user=await getChatGPTUser();return {owner:!!user&&!!runtime().SITE_OWNER_EMAIL&&user.email.toLowerCase()===runtime().SITE_OWNER_EMAIL!.toLowerCase(),signedIn:!!user};}
 export async function setBase(req:Request){
   sameOrigin(req);
@@ -98,7 +119,7 @@ export async function feed() {
   const tail = rows.results[0] || null;
   const active = await db().prepare('SELECT id,status FROM launches WHERE active=1').first();
   const pending=await db().prepare("SELECT * FROM launches WHERE active=1 AND status='submitted'").first<Launch>();
-  return { launches: rows.results.slice(0,100).map(publicLaunch), hasMore: rows.results.length>100, total: total?.n || 0, tail: tail ? publicLaunch(tail) : null, base:await baseToken(), pending:pending?publicLaunch(pending):null, active, uploads: !!runtime().BUCKET, network: 'mainnet-beta',reconciliationError,...await ownerStatus() };
+  return { launches: rows.results.slice(0,100).map(publicLaunch), hasMore: rows.results.length>100, total: total?.n || 0, tail: tail ? publicLaunch(tail) : null, ...await startingToken(), pending:pending?publicLaunch(pending):null, active, uploads: !!runtime().BUCKET, network: 'mainnet-beta',reconciliationError,...await ownerStatus() };
 }
 export async function olderFeed(before: number) {
   const rows = await db().prepare("SELECT * FROM launches WHERE status='finalized' AND sequence<? ORDER BY sequence DESC LIMIT 101").bind(before).all<Launch>();
@@ -130,7 +151,7 @@ export async function prepare(req: Request) {
   await reconcile();
   const last = await db().prepare("SELECT * FROM launches WHERE status='finalized' ORDER BY sequence DESC LIMIT 1").first<Launch>();
   const tail=last||await baseToken();
-  if(!tail) throw new Error('The site owner has not added the starting token CA yet. Launching will open when it is saved.');
+  if(!tail) throw new Error('Launching opens automatically after the starting CA is supplied and verified live on Pump.fun.');
   const id=crypto.randomUUID(), mint=Keypair.generate(), authHash=createHash('sha256').update(payload).digest('hex');
   try {
     // The unique active slot serializes all wallets; terminal rows use NULL.

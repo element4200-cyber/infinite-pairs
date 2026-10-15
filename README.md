@@ -4,7 +4,9 @@ A public Pump.fun launchpad in black, green, and purple, with animated infinity 
 
 ## Starting CA
 
-The site owner opens **Launchpad settings**, signs in with ChatGPT, and pastes the Infinite Pairs token CA after that token is launched on Pump.fun. Only the owner can save this setting. The server validates the mint against Pump.fun’s mainnet bonding-curve program. Launching remains closed until the starting CA is supplied. It cannot change while a launch is active or after the first launch has finalized.
+The owner can send the starting CA in the build chat. Codex registers it through the owner-controlled Sites runtime variable `STARTING_TOKEN_CA`; no site login or settings form is required. Each feed refresh (five seconds while open) and launch request checks the CA against Pump.fun’s finalized mainnet bonding-curve account. A CA supplied before launch remains pending and activates automatically after verification. RPC delays preserve pending status and retry on the next request. No background timer is promised while the app is closed; the next visitor/request checks it. Activation is persisted in D1 and never replaces an existing starting CA or active/finalized chain. Invalid addresses remain inactive.
+
+The existing **Launchpad settings** owner-only form remains an optional way to configure an already live CA using ChatGPT sign-in. Public visitors cannot set the CA. The starting CA is locked while a launch is active or after the first launch finalizes.
 
 The first community token records the configured CA as its predecessor and tries it as the Pump.fun quote. Every later token uses the newest finalized token’s CA, regardless of which wallet launched it. The previously selected SOL fallback remains enabled when Pump.fun rejects a quote for eligibility or maximum-depth reasons. Both the predecessor and actual trading pair are shown before signing and on token details.
 
@@ -24,7 +26,7 @@ D1 reserves one globally unique active launch slot. The selected predecessor is 
 
 ## Server configuration
 
-The Sites manifest provisions `DB` and `BUCKET`. `SITE_OWNER_EMAIL` is a server secret used to authorize CA changes using trusted ChatGPT identity headers; it is never bundled into the browser. `SOLANA_RPC_URL` can select a dedicated mainnet RPC provider; PublicNode is the default. Runtime secrets are managed through Sites environment settings. Never commit credentials or private keys. Public access is managed by Sites access controls.
+The Sites manifest provisions `DB` and `BUCKET`. `SITE_OWNER_EMAIL` is a server secret used to authorize CA changes using trusted ChatGPT identity headers; it is never bundled into the browser. `STARTING_TOKEN_CA` is the owner-provided public mint address used for automatic activation. `SOLANA_RPC_URL` can select a dedicated mainnet RPC provider; PublicNode is the default. Runtime secrets are managed through Sites environment settings. Never commit credentials or private keys. Public access is managed by Sites access controls.
 
 ## Development and verification
 
@@ -47,3 +49,5 @@ A funded end-to-end creation and dev buy still require the user's wallet approva
 - [Official Pump.fun coin creation](https://github.com/pump-fun/pump-public-docs/blob/main/docs/instructions/COIN_CREATION.md)
 - [Quote assets and pairing depth](https://github.com/pump-fun/pump-public-docs/blob/main/docs/instructions/CREATE_WITH_PUMP_COIN_QUOTE.md)
 - [RPC transport](https://solana.publicnode.com/)
+
+`tests/ca-activation.mjs` uses a fresh localhost database and a local RPC simulation backed by a read-only mainnet fixture. It checks prelaunch waiting, transient verification failures, invalid account ownership, concurrent activation, persistence, and anonymous CA-change rejection. No transactions are broadcast.

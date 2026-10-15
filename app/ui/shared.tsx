@@ -3,9 +3,15 @@ import {useState} from 'react';
 import type {VersionedTransaction} from '@solana/web3.js';
 export type Token={id:string;mint:string;name:string;symbol:string;description:string;image:string;predecessor:string|null;quote_mint:string;quote_symbol:string;fallback:string|null;sequence:number;dev_buy:string;depth:number;owner:string;finalized_at:number;signature:string;status:string;error?:string};
 export type BaseToken={mint:string;name:string;symbol:string};
-export type Feed={base:BaseToken|null;owner:boolean;signedIn:boolean;reconciliationError?:string|null;pending:Token|null;launches:Token[];total:number;tail:Token|null;active:{id:string;status:string}|null;hasMore:boolean;uploads:boolean};
+export type Feed={base:BaseToken|null;activation?:{status:'awaiting-ca'|'waiting-for-token'|'active'|'invalid-ca'|'verification-delayed';mint?:string};owner:boolean;signedIn:boolean;reconciliationError?:string|null;pending:Token|null;launches:Token[];total:number;tail:Token|null;active:{id:string;status:string}|null;hasMore:boolean;uploads:boolean};
 export type Provider={publicKey:{toBase58():string}|null;isPhantom?:boolean;connect:()=>Promise<{publicKey:{toBase58():string}}>;disconnect:()=>Promise<void>;signMessage:(m:Uint8Array,encoding?:string)=>Promise<{signature:Uint8Array}|Uint8Array>;signTransaction:(t:VersionedTransaction)=>Promise<VersionedTransaction>};
 export type Prepared={id:string;transaction:string;setupTransaction:string|null;setupRent:number;mint:string;name:string;symbol:string;predecessor:string|null;quoteMint:string;quoteSymbol:string;fallback:string|null;devBuy:string;slippage:number;tokens:string;decimals:number;maxDevBuy:string};
 export const short=(s:string)=>s.slice(0,5)+'…'+s.slice(-4);
+export function activationMessage(feed:Feed){
+ if(feed.activation?.status==='waiting-for-token')return {title:'CA received · waiting for launch',detail:`${short(feed.activation.mint!)} activates automatically when verified live on Pump.fun.`};
+ if(feed.activation?.status==='verification-delayed')return {title:'Verifying the starting CA',detail:'Solana verification is delayed. The app will retry automatically.'};
+ if(feed.activation?.status==='invalid-ca')return {title:'Starting CA needs correction',detail:'The supplied CA could not be verified. The owner can send a corrected CA in the build chat.'};
+ return {title:'Awaiting the starting token CA',detail:'The owner can send the CA in the build chat. Activation is automatic once it is live on Pump.fun.'};
+}
 export function InfinityMark({className=''}:{className?:string}){return <svg className={"infinity-mark "+className} viewBox="0 0 100 50" fill="none" aria-hidden="true"><path d="M50 25C35 0 10 0 10 25s25 25 40 0S90 0 90 25 65 50 50 25Z" stroke="currentColor" strokeWidth="7" strokeLinecap="round"/><path className="logo-tracer" pathLength="100" d="M50 25C35 0 10 0 10 25s25 25 40 0S90 0 90 25 65 50 50 25Z" stroke="currentColor" strokeWidth="7" strokeLinecap="round" strokeDasharray="15 85"/></svg>;}
 export function TokenIcon({token}:{token:Token}){const [failed,setFailed]=useState(false);return <div className={'token-icon hue-'+(token.sequence%3)}>{token.image&&!failed?<img src={token.image} alt="" onError={()=>setFailed(true)}/>:token.sequence===1?<InfinityMark/>:<span>{token.symbol.slice(0,2)}</span>}</div>;}
