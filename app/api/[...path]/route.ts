@@ -1,7 +1,9 @@
 import {uploadArtwork,artwork} from '../../lib/artwork';
+import {rpcFailure} from '../../lib/rpc';
 import { prepare, submit, feed, olderFeed, db, reconcile, publicLaunch, setupStatus, sameOrigin, runtime, setBase, type Launch } from '../../lib/launches';
 export const dynamic='force-dynamic';
 const json=(value:unknown,status=200)=>Response.json(value,{status,headers:{'Cache-Control':'no-store'}});
+function failure(error:unknown,status:number){const rpc=rpcFailure(error);return rpc?Response.json({error:rpc.message,retryAfter:rpc.retryAfter},{status:503,headers:{'Cache-Control':'no-store','Retry-After':String(rpc.retryAfter)}}):json({error:error instanceof Error?error.message:'Service temporarily unavailable'},status);}
 export async function GET(req:Request) {
   try {
     const url=new URL(req.url), path=url.pathname;
@@ -13,7 +15,7 @@ export async function GET(req:Request) {
       return row?json({...publicLaunch(row),...await setupStatus(row)}):json({error:'Launch not found'},404);
     }
     return json({error:'Not found'},404);
-  } catch(e) { return json({error:e instanceof Error?e.message:'Service temporarily unavailable'},503); }
+  } catch(e) { return failure(e,503); }
 }
 export async function POST(req:Request) {
   try {
@@ -23,5 +25,5 @@ export async function POST(req:Request) {
     if(path==='/api/upload')return json(await uploadArtwork(req));
     if(path==='/api/base')return json(await setBase(req));
     return json({error:'Not found'},404);
-  } catch(e) { return json({error:e instanceof Error?e.message:'Launch request failed'},400); }
+  } catch(e) { return failure(e,400); }
 }

@@ -26,7 +26,7 @@ D1 reserves one globally unique active launch slot. The selected predecessor is 
 
 ## Server configuration
 
-The Sites manifest provisions `DB` and `BUCKET`. `SITE_OWNER_EMAIL` is a server secret used to authorize CA changes using trusted ChatGPT identity headers; it is never bundled into the browser. `STARTING_TOKEN_CA` is the owner-provided public mint address used for automatic activation. `SOLANA_RPC_URL` can select a dedicated mainnet RPC provider; PublicNode is the default. Runtime secrets are managed through Sites environment settings. Never commit credentials or private keys. Public access is managed by Sites access controls.
+The Sites manifest provisions `DB` and `BUCKET`. `SITE_OWNER_EMAIL` is a server secret used to authorize CA changes using trusted ChatGPT identity headers; it is never bundled into the browser. `STARTING_TOKEN_CA` is the owner-provided public mint address used for automatic activation. `SOLANA_RPC_URL` selects a dedicated mainnet RPC provider; PublicNode is the shared fallback and is not a production availability guarantee. Store provider URLs containing API keys as Sites runtime secrets. The transport spaces requests, batches initial Pump configuration reads, retries short read throttles at most twice, honors Retry-After, and shares a cooldown within a Worker isolate. Transaction sends are never replayed by this transport. Feed/pending polling shares a short reconciliation window. Missing token accounts count as zero balance; rate limits and provider failures do not. RPC failures are returned as safe 503 responses with Retry-After, and stored pending signatures continue to be tracked. Runtime secrets are managed through Sites environment settings. Never commit credentials or private keys. Public access is managed by Sites access controls.
 
 ## Development and verification
 
@@ -51,3 +51,5 @@ A funded end-to-end creation and dev buy still require the user's wallet approva
 - [RPC transport](https://solana.publicnode.com/)
 
 `tests/ca-activation.mjs` uses a fresh localhost database and a local RPC simulation backed by a read-only mainnet fixture. It checks prelaunch waiting, transient verification failures, invalid account ownership, concurrent activation, persistence, and anonymous CA-change rejection. No transactions are broadcast.
+
+`node --experimental-strip-types tests/rpc-transport.mjs` exercises throttling, cooldowns, request pacing, safe errors and no automatic transaction replay without network calls. With a fresh localhost DB, owner fixture, and SOLANA_RPC_URL=http://127.0.0.1:4199, `node tests/rpc-recovery-flow.mjs` runs unsigned SDK preparation through a local proxy that injects 429s, checks batched configuration reads and safe 503 responses, and performs only read-only mainnet lookups. No test broadcasts a signed transaction.

@@ -3,7 +3,8 @@ import { createPublicKey, verify, createHash } from 'node:crypto';
 import { Buffer } from 'node:buffer';
 import { Connection, PublicKey, Keypair, TransactionMessage, VersionedTransaction, AddressLookupTableProgram, AddressLookupTableAccount, ComputeBudgetProgram } from '@solana/web3.js';
 import { getAssociatedTokenAddressSync } from '@solana/spl-token';
-import { OnlinePumpSdk, PUMP_SDK, getBuyTokenAmountFromSolAmount, newBondingCurve, bondingCurvePda, PUMP_PROGRAM_ID } from '@pump-fun/pump-sdk';
+import { OnlinePumpSdk, PUMP_SDK, getBuyTokenAmountFromSolAmount, newBondingCurve, bondingCurvePda, PUMP_PROGRAM_ID, GLOBAL_PDA, PUMP_FEE_CONFIG_PDA, QUOTE_CONTROL_PDA } from '@pump-fun/pump-sdk';
+import {createRpcFetch,missingTokenAccount,rpcFailure} from './rpc';
 import { getChatGPTUser } from '../chatgpt-auth';
 import BN from 'bn.js';
 import { SOL, ROOT_NAME, ROOT_SYMBOL, baseUnits, fallbackReason, validUri, base58 } from './rules';
@@ -59,7 +60,7 @@ export function db() { const db = runtime().DB; if (!db) throw new Error('Shared
 export function connection() {
   return new Connection(runtime().SOLANA_RPC_URL || 'https://solana-rpc.publicnode.com', {
     commitment: 'confirmed', disableRetryOnRateLimit: true,
-    fetch: (url, options) => fetch(url, { ...options, signal: AbortSignal.timeout(18000) }),
+    fetch: createRpcFetch(),
   });
 }
 export function publicLaunch(row: Launch) {
@@ -70,13 +71,17 @@ export function sameOrigin(req: Request) {
   const origin = req.headers.get('origin');
   if (!origin || origin !== new URL(req.url).origin) throw new Error('Open the app directly to submit a launch.');
 }
-export async function reconcile() {
+const recentChecks=new Map<string,number>();
+export async function reconcile(force=false) {
   const row = await db().prepare('SELECT * FROM launches WHERE active = 1').first<Launch>();
   if (!row) return;
   if (row.status === 'building') {
     if (row.build_until < Date.now()) await db().prepare("UPDATE launches SET status='expired', active=NULL, error='Preparation timed out' WHERE id=? AND status='building'").bind(row.id).run();
     return;
   }
+  // The feed and pending dialog both poll; share a short verification window.
+  if(!force&&Date.now()-(recentChecks.get(row.id)??0)<4000)return;
+  if(recentChecks.size>8)recentChecks.clear();recentChecks.set(row.id,Date.now());
   const rpc = connection();
   if (row.signature) {
     const status = (await rpc.getSignatureStatuses([row.signature], { searchTransactionHistory: true })).value[0];
@@ -148,7 +153,7 @@ export async function prepare(req: Request) {
   if (image && !image.startsWith(assetPrefix)) throw new Error('Import an image using this app.');
   if (typeof devBuy!=='string'||!Number.isInteger(slippage)||slippage<0||slippage>10) throw new Error('Invalid dev-buy or slippage setting.');
   baseUnits(devBuy,9);
-  await reconcile();
+  await reconcile(true);
   const last = await db().prepare("SELECT * FROM launches WHERE status='finalized' ORDER BY sequence DESC LIMIT 1").first<Launch>();
   const tail=last||await baseToken();
   if(!tail) throw new Error('Launching opens automatically after the starting CA is supplied and verified live on Pump.fun.');
@@ -160,7 +165,10 @@ export async function prepare(req: Request) {
   } catch { throw new Error('Another launch is being finalized, or this authorization was already used. Wait for the next slot and try again.'); }
   try {
     const rpc=connection(), online=new OnlinePumpSdk(rpc);
-    const [global,feeConfig,quoteControl]=await Promise.all([online.fetchGlobal(),online.fetchFeeConfig(),online.fetchQuoteControl()]);
+    // Fetch public Pump configuration in one RPC call instead of three concurrent calls.
+    const [globalInfo,feeInfo,quoteInfo]=await rpc.getMultipleAccountsInfo([GLOBAL_PDA,PUMP_FEE_CONFIG_PDA,QUOTE_CONTROL_PDA]);
+    if(!globalInfo||!feeInfo)throw new Error('Pump.fun configuration is temporarily unavailable. Please try again.');
+    const global=PUMP_SDK.decodeGlobal(globalInfo),feeConfig=PUMP_SDK.decodeFeeConfig(feeInfo),quoteControl=quoteInfo?PUMP_SDK.decodeQuoteControl(quoteInfo):null;
     if (!global.createV2Enabled) throw new Error('Pump.fun has temporarily disabled token creation.');
     let quote, fallback: string|null=null;
     if (tail) {
@@ -179,7 +187,7 @@ export async function prepare(req: Request) {
       tokens=amount.toString();
       if (quoteSymbol!=='SOL') {
         const ata=getAssociatedTokenAddressSync(quote.mint,user,false,quote.quoteTokenProgram);
-        let balance='0'; try { balance=(await rpc.getTokenAccountBalance(ata)).value.amount; } catch { /* Missing account is zero balance. */ }
+        let balance='0'; try { balance=(await rpc.getTokenAccountBalance(ata)).value.amount; } catch(e) { if(!missingTokenAccount(e))throw e; }
         if (BigInt(balance)<BigInt(units.muln(100+slippage).divn(100).toString())) throw new Error(`Your wallet needs ${devBuy} ${quoteSymbol}, plus slippage, for this dev buy. Buy the previous token on Pump.fun first, or set the dev buy to zero.`);
       }
       instructions.push(await PUMP_SDK.createV2Instruction(common));
@@ -209,7 +217,7 @@ export async function prepare(req: Request) {
     if (!result.meta.changes) throw new Error('Preparation expired. Please try again.');
     return {id,transaction:serialized,setupTransaction,setupRent,mint:mint.publicKey.toBase58(),name,symbol,predecessor:tail?.mint||null,quoteMint:quote.mint.toBase58(),quoteSymbol,fallback,devBuy,slippage,tokens,lastValidBlockHeight:latest.lastValidBlockHeight,network:'mainnet-beta',maxDevBuy:units.muln(100+slippage).divn(100).toString(),decimals:quote.decimals};
   } catch(e) {
-    await db().prepare("UPDATE launches SET status='failed',active=NULL,error=? WHERE id=? AND status='building'").bind(e instanceof Error?e.message:'Preparation failed',id).run();
+    await db().prepare("UPDATE launches SET status='failed',active=NULL,error=? WHERE id=? AND status='building'").bind(rpcFailure(e)?.message||(e instanceof Error?e.message:'Preparation failed'),id).run();
     throw e;
   }
 }
