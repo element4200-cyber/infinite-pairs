@@ -3,7 +3,8 @@ import { createPublicKey, verify, createHash } from 'node:crypto';
 import { Buffer } from 'node:buffer';
 import { Connection, PublicKey, Keypair, TransactionMessage, VersionedTransaction, AddressLookupTableProgram, AddressLookupTableAccount, ComputeBudgetProgram } from '@solana/web3.js';
 import { getAssociatedTokenAddressSync } from '@solana/spl-token';
-import { OnlinePumpSdk, PUMP_SDK, getBuyTokenAmountFromSolAmount, newBondingCurve } from '@pump-fun/pump-sdk';
+import { OnlinePumpSdk, PUMP_SDK, getBuyTokenAmountFromSolAmount, newBondingCurve, bondingCurvePda, PUMP_PROGRAM_ID } from '@pump-fun/pump-sdk';
+import { getChatGPTUser } from '../chatgpt-auth';
 import BN from 'bn.js';
 import { SOL, ROOT_NAME, ROOT_SYMBOL, baseUnits, fallbackReason, validUri, base58 } from './rules';
 export type Launch = {
@@ -14,7 +15,24 @@ export type Launch = {
   last_valid: number | null; transaction: string | null; signature: string | null; error: string | null;
   setup_transaction: string | null; setup_signature: string | null;
 };
-type Runtime = { DB?: D1Database; PINATA_JWT?: string; SOLANA_RPC_URL?: string };
+type Runtime = { DB?: D1Database; BUCKET?: R2Bucket; SITE_OWNER_EMAIL?: string; SOLANA_RPC_URL?: string };
+export type BaseToken={mint:string;name:string;symbol:string};
+export async function baseToken(){return db().prepare('SELECT mint,name,symbol FROM chain_config WHERE id=1').first<BaseToken>();}
+export async function ownerStatus(){const user=await getChatGPTUser();return {owner:!!user&&!!runtime().SITE_OWNER_EMAIL&&user.email.toLowerCase()===runtime().SITE_OWNER_EMAIL!.toLowerCase(),signedIn:!!user};}
+export async function setBase(req:Request){
+  sameOrigin(req);
+  if(!(await ownerStatus()).owner) throw new Error('Only the signed-in site owner can configure the starting CA.');
+  const {mint}=await req.json() as {mint:string}; const key=new PublicKey(mint);
+  const account=await connection().getAccountInfo(bondingCurvePda(key),'finalized');
+  if(!account||!account.owner.equals(PUMP_PROGRAM_ID)) throw new Error('This CA is not a live Pump.fun token on Solana mainnet.');
+  PUMP_SDK.decodeBondingCurve(account);
+  const user=await getChatGPTUser();
+  const guard="NOT EXISTS(SELECT 1 FROM launches WHERE status='finalized' OR active=1)";
+  const result=await db().prepare(`INSERT INTO chain_config(id,mint,name,symbol,configured_by,updated_at) SELECT 1,?,?,?,?,? WHERE ${guard} ON CONFLICT(id) DO UPDATE SET mint=excluded.mint,name=excluded.name,symbol=excluded.symbol,configured_by=excluded.configured_by,updated_at=excluded.updated_at WHERE ${guard}`)
+    .bind(key.toBase58(),ROOT_NAME,ROOT_SYMBOL,user!.userId,Date.now()).run();
+  if(!result.meta.changes) throw new Error('The starting CA is locked once a launch is active or finalized.');
+  return {base:await baseToken()};
+}
 export const runtime = () => env as Runtime;
 export function db() { const db = runtime().DB; if (!db) throw new Error('Shared launch storage is unavailable.'); return db; }
 export function connection() {
@@ -73,12 +91,14 @@ export async function reconcile() {
   }
 }
 export async function feed() {
-  await reconcile();
+  let reconciliationError:string|null=null;
+  try{await reconcile();}catch{reconciliationError='Solana verification is temporarily delayed. Existing launches remain visible.';}
   const rows = await db().prepare("SELECT * FROM launches WHERE status='finalized' ORDER BY sequence DESC LIMIT 101").all<Launch>();
   const total = await db().prepare("SELECT COUNT(*) AS n FROM launches WHERE status='finalized'").first<{ n: number }>();
   const tail = rows.results[0] || null;
   const active = await db().prepare('SELECT id,status FROM launches WHERE active=1').first();
-  return { launches: rows.results.slice(0,100).map(publicLaunch), hasMore: rows.results.length>100, total: total?.n || 0, tail: tail ? publicLaunch(tail) : null, active, uploads: !!runtime().PINATA_JWT, network: 'mainnet-beta' };
+  const pending=await db().prepare("SELECT * FROM launches WHERE active=1 AND status='submitted'").first<Launch>();
+  return { launches: rows.results.slice(0,100).map(publicLaunch), hasMore: rows.results.length>100, total: total?.n || 0, tail: tail ? publicLaunch(tail) : null, base:await baseToken(), pending:pending?publicLaunch(pending):null, active, uploads: !!runtime().BUCKET, network: 'mainnet-beta',reconciliationError,...await ownerStatus() };
 }
 export async function olderFeed(before: number) {
   const rows = await db().prepare("SELECT * FROM launches WHERE status='finalized' AND sequence<? ORDER BY sequence DESC LIMIT 101").bind(before).all<Launch>();
@@ -96,18 +116,25 @@ export async function prepare(req: Request) {
   if (!verify(null, Buffer.from(payload), publicKey, Buffer.from(signature,'base64'))) throw new Error('Wallet authorization failed.');
   const {name,symbol,uri,description='',image='',devBuy='0',slippage=1}=p;
   if (typeof name!=='string'||!name.trim()||Buffer.byteLength(name)>32||typeof symbol!=='string'||!symbol.trim()||Buffer.byteLength(symbol)>13) throw new Error('Use a name up to 32 bytes and a ticker up to 13 bytes.');
-  if (typeof uri!=='string'||!validUri(uri)) throw new Error('Provide a public HTTPS or IPFS metadata URI, at most 200 characters.');
+  if (typeof uri!=='string'||uri.length>200) throw new Error('Import a token image before preparing the launch.');
+  const assetPrefix=new URL(req.url).origin+'/api/assets/';
+  if(!uri.startsWith(assetPrefix)||!/^[-a-f0-9]{36}\.json$/.test(uri.slice(assetPrefix.length))) throw new Error('Import an image using this app before preparing the token.');
+  const uploadedId=uri.slice(assetPrefix.length,-5);
+  const uploaded=await db().prepare('SELECT owner,name,symbol,description,image FROM uploads WHERE id=?').bind(uploadedId).first<{owner:string;name:string;symbol:string;description:string;image:string}>();
+  if(!uploaded||uploaded.owner!==user.toBase58()) throw new Error('The token image must be uploaded by the connected wallet.');
+  if(uploaded.name!==name||uploaded.symbol!==symbol||uploaded.description!==description||uploaded.image!==image)throw new Error('Token details changed after image upload. Import the image again.');
   if (typeof description!=='string'||description.length>1000||typeof image!=='string'||image.length>500) throw new Error('Token details are too long.');
-  if (image && !/^https:\/\//.test(image)) throw new Error('Artwork must use an HTTPS URL.');
+  if (image && !image.startsWith(assetPrefix)) throw new Error('Import an image using this app.');
   if (typeof devBuy!=='string'||!Number.isInteger(slippage)||slippage<0||slippage>10) throw new Error('Invalid dev-buy or slippage setting.');
   baseUnits(devBuy,9);
   await reconcile();
-  const tail = await db().prepare("SELECT * FROM launches WHERE status='finalized' ORDER BY sequence DESC LIMIT 1").first<Launch>();
-  if (!tail && (name!==ROOT_NAME||symbol!==ROOT_SYMBOL)) throw new Error('The first launch must be Infinite Pairs (INFINITE).');
+  const last = await db().prepare("SELECT * FROM launches WHERE status='finalized' ORDER BY sequence DESC LIMIT 1").first<Launch>();
+  const tail=last||await baseToken();
+  if(!tail) throw new Error('The site owner has not added the starting token CA yet. Launching will open when it is saved.');
   const id=crypto.randomUUID(), mint=Keypair.generate(), authHash=createHash('sha256').update(payload).digest('hex');
   try {
     // The unique active slot serializes all wallets; terminal rows use NULL.
-    await db().prepare("INSERT INTO launches (id,auth_hash,owner,mint,name,symbol,uri,description,image,predecessor,dev_buy,slippage,status,active,created_at,build_until) SELECT ?,?,?,?,?,?,?,?,?,?,?,?,'building',1,?,? WHERE COALESCE((SELECT mint FROM launches WHERE status='finalized' ORDER BY sequence DESC LIMIT 1),'')=?")
+    await db().prepare("INSERT INTO launches (id,auth_hash,owner,mint,name,symbol,uri,description,image,predecessor,dev_buy,slippage,status,active,created_at,build_until) SELECT ?,?,?,?,?,?,?,?,?,?,?,?,'building',1,?,? WHERE COALESCE((SELECT mint FROM launches WHERE status='finalized' ORDER BY sequence DESC LIMIT 1),(SELECT mint FROM chain_config WHERE id=1))=?")
       .bind(id,authHash,user.toBase58(),mint.publicKey.toBase58(),name,symbol,uri,description,image,tail?.mint||null,devBuy,slippage,Date.now(),Date.now()+60000,tail?.mint||'').run().then(r=>{if(!r.meta.changes) throw new Error('Chain changed');});
   } catch { throw new Error('Another launch is being finalized, or this authorization was already used. Wait for the next slot and try again.'); }
   try {

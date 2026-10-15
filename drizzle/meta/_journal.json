@@ -15,6 +15,13 @@
       "when": 1792041682034,
       "tag": "0001_familiar_namora",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1792042927972,
+      "tag": "0002_fresh_crusher_hogan",
+      "breakpoints": true
     }
   ]
 }

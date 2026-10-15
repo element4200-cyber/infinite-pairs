@@ -1,0 +1,14 @@
+import assert from 'node:assert/strict';
+import {createPrivateKey,sign,createHash} from 'node:crypto';
+import {Keypair,VersionedTransaction} from '@solana/web3.js';
+const origin=process.env.TEST_ORIGIN||'http://127.0.0.1:4173';
+if(!['127.0.0.1','localhost'].includes(new URL(origin).hostname))throw new Error('These write tests only run against a local preview.');
+const owner={'oai-authenticated-user-id':'local-owner-test','oai-authenticated-user-email':'seedy@sites.test'};
+const newest='8RWY2rx2K1aeDRDNHX4DcZwohdc9V4XfR75D2zkvpump';
+async function request(path,body,headers={}){const response=await fetch(origin+path,{method:body?'POST':'GET',headers:{Origin:origin,...headers,...(body instanceof FormData?{}:{'Content-Type':'application/json'})},body:body?(body instanceof FormData?body:JSON.stringify(body)):undefined});return {status:response.status,data:await response.json()};}
+function authorize(user,data){const payload=JSON.stringify({domain:origin,wallet:user.publicKey.toBase58(),timestamp:Date.now(),nonce:crypto.randomUUID(),...data});const key=createPrivateKey({key:Buffer.concat([Buffer.from('302e020100300506032b657004220420','hex'),Buffer.from(user.secretKey.slice(0,32))]),format:'der',type:'pkcs8'});return{payload,signature:sign(null,Buffer.from(payload),key).toString('base64')};}
+const bytes=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aWZ8AAAAASUVORK5CYII=','base64');
+
+const feed=(await request('/api/feed')).data;assert.equal(feed.total,102);assert.equal(feed.launches.length,100);assert.equal(feed.hasMore,true);assert.equal(feed.tail.mint,newest);assert.equal(new Set(feed.launches.map(t=>t.owner)).size,2);
+const older=(await request('/api/feed?before='+Math.min(...feed.launches.map(t=>t.sequence)))).data;assert.equal(older.launches.length,2);assert.equal(older.hasMore,false);
+const user=Keypair.generate(),name='Newest CA test',symbol='NEXT',description='LOCAL LIST TEST — NEVER BROADCAST';const data={action:'Upload Infinite Pairs artwork',imageHash:createHash('sha256').update(bytes).digest('hex'),name,symbol,description};const auth=authorize(user,data),form=new FormData();form.append('file',new File([bytes],'token.png',{type:'image/png'}));form.append('payload',auth.payload);form.append('signature',auth.signature);const upload=await request('/api/upload',form);assert.equal(upload.status,200);const launch=await request('/api/prepare',authorize(user,{action:'Prepare Infinite Pairs launch',name,symbol,description,...upload.data,devBuy:'0',slippage:1}));assert.equal(launch.status,200,JSON.stringify(launch.data));assert.equal(launch.data.predecessor,newest);assert.equal(launch.data.quoteMint,newest);assert.notEqual(launch.data.predecessor,feed.base.mint);console.log('PASS: all creators visible, 102 launches reachable through pagination, and the next launch uses the newest CA instead of the starting CA. No transaction broadcast.');

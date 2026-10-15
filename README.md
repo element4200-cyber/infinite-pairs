@@ -1,61 +1,49 @@
 # Infinite Pairs
 
-A Pump.fun launchpad in black, lime green, and purple. The first launch is Infinite Pairs (`INFINITE`), paired with SOL. Each subsequent launch records the last finalized launch as its predecessor and tries that mint as the actual Pump.fun quote asset.
+A public Pump.fun launchpad in black, green, and purple, with animated infinity tracing, image import, a shared launch list, and automatic predecessor pairing.
 
-## Open and launch
+## Starting CA
 
-Open the hosted app in a browser with Phantom or Solflare installed. Connect your wallet, choose **Create a token**, add a public token metadata URI, optionally enable a dev buy, and select **Review launch**. A message signature authorizes preparation; it does not spend funds. Check the exact trading pair and maximum dev-buy spend, then approve the launch transaction in your wallet.
+The site owner opens **Launchpad settings**, signs in with ChatGPT, and pastes the Infinite Pairs token CA after that token is launched on Pump.fun. Only the owner can save this setting. The server validates the mint against Pump.fun’s mainnet bonding-curve program. Launching remains closed until the starting CA is supplied. It cannot change while a launch is active or after the first launch has finalized.
 
-Pump.fun currently exposes a configurable maximum pairing depth (2 when checked on October 14, 2026). Infinite Pairs reads the network configuration through `@pump-fun/pump-sdk` 4.1.0. Expected quote eligibility/depth failures select SOL while preserving the predecessor link. RPC failures and temporarily incomplete migrations stop preparation rather than silently changing a quote. The review displays every fallback.
+The first community token records the configured CA as its predecessor and tries it as the Pump.fun quote. Every later token uses the newest finalized token’s CA, regardless of which wallet launched it. The previously selected SOL fallback remains enabled when Pump.fun rejects a quote for eligibility or maximum-depth reasons. Both the predecessor and actual trading pair are shown before signing and on token details.
 
-Dev buys use the **actual quote asset**. A SOL launch spends SOL; a token-paired launch requires the previous token in the wallet. Network fees and account rent are additional. Creation and the dev buy are atomic in the same transaction. Large transactions use a wallet-owned address lookup table: this requires an earlier wallet approval and rent payment, disclosed before signing. Setup rent is paid even if the token launch is canceled.
+## Image import and token creation
 
-All launched tokens shown in the feed were created through Infinite Pairs and verified at Solana finality. The feed refreshes every 12 seconds and supports earlier-launch pagination. It does not claim to index every unrelated token launched on Pump.fun.
+Open the site in a browser with Phantom or Solflare installed. Connect a wallet, enter a token name, ticker, and optional description, and import a PNG, JPEG, WebP, or GIF (up to 4 MB). The app uploads the image and generates token details automatically. No metadata URL or Pinata key is required.
 
-## Metadata and optional server configuration
+Artwork and generated JSON are stored immutably in R2 and served publicly under `/api/assets/`, so Pump.fun can resolve them. Wallet message signatures authorize uploads and preparation. File bytes are checked against the signed SHA-256 digest, accepted file signatures, and size limits. Preparation only accepts an image upload belonging to the same wallet with matching token details. Public upload traffic is limited per signed wallet.
 
-A public HTTPS/IPFS metadata URI works without an upload integration. The URI must be at most 200 characters and should contain matching `name` and `symbol`, plus `description` and a public `image` URL. For example:
+Optional dev buys are paid in the actual quote asset. For a token pair, the wallet needs the previous token. Creation and the dev buy are atomic. Large transactions can require an earlier, separately approved address lookup-table setup; its rent is disclosed and is paid even if the later launch is canceled. Network fees and account rent are additional.
 
-```json
-{
-  "name": "Infinite Pairs",
-  "symbol": "INFINITE",
-  "description": "Every launch, connected.",
-  "image": "https://your-public-artwork-host/infinite-pairs.png"
-}
-```
+## All launches
 
-To enable in-app image and metadata uploads, configure the hosted server secret `PINATA_JWT` with Pinata pinning permissions. Configure `SOLANA_RPC_URL` for a dedicated mainnet provider if desired. PublicNode is the default RPC transport. Never put private keys or these credentials in the frontend, source manifest, or committed files. Runtime secrets are managed through Sites environment settings. Uploads use public IPFS, allowing Pump.fun to resolve metadata even while the app preview is private.
+The shared list and **All launches** tab include every creator’s launches. Submitted transactions appear as pending; successful finalized transactions enter the verified list and become eligible to be the next predecessor. The list refreshes every five seconds and has pagination for all earlier launches. RPC verification delays leave existing records visible. The app indexes launches created through this launchpad, rather than every unrelated Pump.fun token.
 
-## Shared launch ordering
+D1 reserves one globally unique active launch slot. The selected predecessor is checked atomically when reserving it. Signed transactions must match the exact prepared message, and their signatures are stored before broadcast. Receipts must match that same message before a launch becomes verified. Reloads recover pending state, and prepared slots expire only after finalized block height exceeds their validity with no mint account.
 
-Cloudflare D1 has one globally unique active launch slot. The predecessor is checked atomically when reserving it. A prepared slot remains held until finalized execution, finalized failure, or finalized block height beyond transaction validity with no mint account. Signed transaction signatures are stored before broadcast, and receipts must match the exact prepared message. Requests require wallet message signatures, timestamp/domain checks, unique authorizations, and same-origin submission. Mint keys are generated ephemerally for partial signatures and never persisted.
+## Server configuration
 
-Rejected wallet approvals can be retried while a blockhash remains valid. Reloads recover the pending launch ID and unsigned prepared transaction in the same browser tab. If a signed transaction is broadcast elsewhere, matching mint transaction history can recover it after expiry.
+The Sites manifest provisions `DB` and `BUCKET`. `SITE_OWNER_EMAIL` is a server secret used to authorize CA changes using trusted ChatGPT identity headers; it is never bundled into the browser. `SOLANA_RPC_URL` can select a dedicated mainnet RPC provider; PublicNode is the default. Runtime secrets are managed through Sites environment settings. Never commit credentials or private keys. Public access is managed by Sites access controls.
 
-## Local development
+## Development and verification
 
-Requires Node.js 22.13+ and pnpm 11.25.0. Run `pnpm install`, then `pnpm dev`. Run `pnpm build` to build the Cloudflare Worker. Preserve the Sites Vite integration and `.openai/hosting.json` project ID. D1 migrations are in `drizzle/`; apply them to the local DB using the configured Wrangler command before testing. Hosted publication applies migrations separately.
+Requires Node.js 22.13+ and pnpm 11.25.0. Run `pnpm install`, `pnpm build`, and apply the SQL migrations in `drizzle/` to the **local** D1 database before previewing. `pnpm dev` starts the development preview. Preserve the Sites Vite integration and project ID.
+
+Type check:
 
 ```powershell
-pnpm build
-node --import ./scripts/sites-env.mjs ./node_modules/wrangler/bin/wrangler.js d1 execute DB --local --config dist/server/wrangler.json --persist-to .wrangler/state --file drizzle/0000_foamy_jubilee.sql
-node --import ./scripts/sites-env.mjs ./node_modules/wrangler/bin/wrangler.js d1 execute DB --local --config dist/server/wrangler.json --persist-to .wrangler/state --file drizzle/0001_familiar_namora.sql
-pnpm dev
+node node_modules/typescript/bin/tsc --noEmit --incremental false
 ```
 
-The preview and hosted databases are separate. Never apply test cleanup to the hosted database.
+`tests/public-flow.mjs` runs only against localhost. It verifies signed artwork import, anonymous image/JSON retrieval, matching token details, owner-only CA configuration, CA locking, first-token pairing, concurrent reservations, and unsigned transaction rejection. The local preview must use the non-secret test owner `SITE_OWNER_EMAIL=seedy@sites.test`; production owner configuration stays separate. A real existing Pump.fun mint is used only for RPC reads and local configuration. No valid signed transaction is broadcast.
 
-## Verification
+`tests/list-fixtures.sql` is explicitly synthetic **localhost-only** data. With those fixtures loaded, `tests/shared-list.mjs` checks cross-wallet visibility, 102-entry pagination, and selection of the newest CA instead of the starting CA. Remove those synthetic localhost records after testing. Never apply test fixtures or cleanup to a hosted/remote database. Source publication only applies the schema-only migrations in `drizzle/`.
 
-`node node_modules/typescript/bin/tsc --noEmit --incremental false` checks TypeScript. `node --experimental-strip-types tests/launch-flow.mjs` checks the local API with generated, unfunded wallets. It exercises signed authorization, genesis enforcement, concurrent reservations, exact decimal amounts, v0 sizing, lookup-table rent, mint partial signing, unsigned/tampered rejection, and exclusion of pending tokens from the feed. Set `TEST_ORIGIN` to test the built preview instead of the development server. Tests use mainnet **read** operations and never submit a valid signed transaction or spend funds. Local prepared test slots expire naturally.
+A funded end-to-end creation and dev buy still require the user's wallet approval and have not been performed by the build agent.
 
-A funded end-to-end creation, dev buy, and finalization requires the user's wallet approval and has not been executed by the build agent. No token or investment return is promised.
-
-## Protocol references
+## References
 
 - [Official Pump.fun coin creation](https://github.com/pump-fun/pump-public-docs/blob/main/docs/instructions/COIN_CREATION.md)
-- [Pump coin quote assets and depth limits](https://github.com/pump-fun/pump-public-docs/blob/main/docs/instructions/CREATE_WITH_PUMP_COIN_QUOTE.md)
-- [Solana RPC transport](https://solana.publicnode.com/)
-
-This site is an independent integration and is not presented as a Pump.fun-operated product. Hosting starts as an owner-private preview. Public access can be enabled separately when the owner chooses to share it.
+- [Quote assets and pairing depth](https://github.com/pump-fun/pump-public-docs/blob/main/docs/instructions/CREATE_WITH_PUMP_COIN_QUOTE.md)
+- [RPC transport](https://solana.publicnode.com/)
