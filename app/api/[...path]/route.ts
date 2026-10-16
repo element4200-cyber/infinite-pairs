@@ -24,9 +24,9 @@ export async function GET(req:Request) {
     if(path==='/api/feed') return json(url.searchParams.has('before')?await olderFeed(Math.max(1,Number(url.searchParams.get('before'))||1)):await feed());
     if(path==='/api/creations')return json(await creationPage(Math.max(1,Number(url.searchParams.get('before'))||Number.MAX_SAFE_INTEGER)));
     if(path.startsWith('/api/launch/')) {
-      await reconcile(path.split('/').pop());
+      const progress=await reconcile(path.split('/').pop());
       const row=await db().prepare('SELECT * FROM triple_launches WHERE id=?').bind(path.split('/').pop()).first<Launch>();
-      return row?json({...publicLaunch(row),...await setupStatus(row)}):json({error:'Launch not found'},404);
+      return row?json({...publicLaunch(row),confirmationStatus:progress[row.id]??null,...await setupStatus(row)}):json({error:'Launch not found'},404);
     }
     return json({error:'Not found'},404);
   } catch(e) { return failure(e,503); }

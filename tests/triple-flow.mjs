@@ -20,7 +20,7 @@ else{
 }
 const toInfo=a=>({...a,owner:new PublicKey(a.owner),data:Buffer.from(a.data[0],'base64')});
 const global=PUMP_SDK.decodeGlobal(toInfo(fixture[0])),quoteControl=fixture[2]?PUMP_SDK.decodeQuoteControl(toInfo(fixture[2])):null;
-const accounts=new Map(keys.map((k,i)=>[k.toBase58(),fixture[i]])),sent=new Map();let height=100,inject429=true,sendCount=0;
+const accounts=new Map(keys.map((k,i)=>[k.toBase58(),fixture[i]])),sent=new Map();let height=100,inject429=true,sendCount=0,sendAttempts=0,sendBehavior='ok';
 async function addMockCoin(mint,quote=SOL,depth=0,mayhem=false){
  const key=new PublicKey(mint),data=Buffer.alloc(82);data.writeBigUInt64LE(1000000000000000n,36);data[44]=6;data[45]=1;
  accounts.set(mint,{data:[data.toString('base64'),'base64'],owner:TOKEN_PROGRAM_ID.toBase58(),lamports:1000000,executable:false,rentEpoch:0});
@@ -41,6 +41,9 @@ const mock=createServer(async(req,res)=>{try{
  else if(r.method==='getMinimumBalanceForRentExemption')result=1000000;
  else if(r.method==='getTokenAccountBalance')result={context,value:{amount:'1000000000000000',decimals:6,uiAmount:1000000000}};
  else if(r.method==='sendTransaction'){
+   sendAttempts++;
+   if(sendBehavior==='reject'){await new Promise(resolve=>setTimeout(resolve,200));res.writeHead(200,{'Content-Type':'application/json'});res.end(JSON.stringify({jsonrpc:'2.0',id:r.id,error:{code:-32002,message:'Transaction simulation failed: Insufficient funds for rent',data:{err:{InstructionError:[2,'InsufficientFunds']},logs:['SYNTHETIC LOCAL preflight rejection']}}}));return;}
+   if(sendBehavior==='ambiguous'){res.writeHead(503,{'Content-Type':'application/json'});res.end(JSON.stringify({error:'SYNTHETIC LOCAL dropped acknowledgement'}));return;}
    const tx=VersionedTransaction.deserialize(Buffer.from(r.params[0],'base64'));result=base58(tx.signatures[0]);sent.set(result,tx);sendCount++;
  }else if(r.method==='getSignatureStatuses')result={context,value:r.params[0].map(s=>sent.has(s)?{slot:1000,confirmations:null,err:null,confirmationStatus:'finalized'}:null)};
  else if(r.method==='getTransaction'){
@@ -92,8 +95,21 @@ try{
  const mayhemMint=Keypair.generate().publicKey.toBase58();await addMockCoin(mayhemMint,SOL,0,true);
  const mayhemGroup=await request('/api/groups',auth(users[0],'Add Triple Pairs main coin',{mint:mayhemMint,name:'Ineligible quote fixture',symbol:'LOCAL'}));assert.equal(mayhemGroup.status,200);
  const fallback=await prepare(users[0],meta[0],{mode:'pair',groupId:mayhemGroup.data.id,slot:1});assert.equal(fallback.status,200,JSON.stringify(fallback));assert.equal(fallback.data.predecessor,mayhemMint);assert.equal(fallback.data.quoteMint,SOL);assert(fallback.data.fallback);await finalize(users[0],fallback.data);
+ // Regression: a definite failed dev-buy preflight must terminate; a lost
+ // acknowledgement must remain tracked, including when a later retry is rejected.
+ const rejectedBuy=await prepare(users[1],meta[1],{mode:'main'},'0.09');assert.equal(rejectedBuy.status,200);
+ async function sendDevBuy(p){const tx=VersionedTransaction.deserialize(Buffer.from(p.transaction,'base64'));tx.sign([users[1]]);return request('/api/submit',{id:p.id,transaction:Buffer.from(tx.serialize()).toString('base64')});}
+ sendBehavior='reject';const attempts=sendAttempts,rejections=await Promise.all([sendDevBuy(rejectedBuy.data),sendDevBuy(rejectedBuy.data)]);
+ assert.equal(sendAttempts-attempts,1,'Competing requests must not broadcast concurrently');
+ const rejection=rejections.find(r=>r.data.status==='failed');assert(rejection,JSON.stringify(rejections));assert.match(rejection.data.message,/rent, and network fees/);
+ assert.equal((await request('/api/launch/'+rejectedBuy.data.id)).data.status,'failed');
+ assert(!(await request('/api/feed')).data.pending.some(t=>t.id===rejectedBuy.data.id),'Failed dev buy releases its reservation');
+ const uncertainBuy=await prepare(users[1],meta[1],{mode:'main'},'0.09');assert.equal(uncertainBuy.status,200);
+ sendBehavior='ambiguous';assert.equal((await sendDevBuy(uncertainBuy.data)).data.status,'submitted');
+ sendBehavior='reject';assert.equal((await sendDevBuy(uncertainBuy.data)).data.status,'submitted','Retry rejection cannot cancel an earlier ambiguous send');
+ height=300;await new Promise(resolve=>setTimeout(resolve,5200));assert.equal((await request('/api/launch/'+uncertainBuy.data.id)).data.status,'expired');sendBehavior='ok';
  // Keep the obsolete unconsumed-body request last: the local proxy closes its keepalive session afterward.
  assert.equal((await request('/api/base',{mint:imported})).status,404,'Legacy CA endpoint removed');
- assert(sendCount>=8);console.log('PASS: reset board, signed CA import, duplicate prevention, metadata upload, sequential pair slots, concurrent slot race, independent simultaneous groups, dev buy preparation, two-pair cap, newest-coin auto selection across older groups, explicit SOL fallback, unsigned rejection, exact-message receipt finalization, shared feed, and no private fields.');
+ assert(sendCount>=8);console.log('PASS: reset board, signed CA import, duplicate prevention, metadata upload, sequential pair slots, concurrent slot race, independent simultaneous groups, dev buy preparation, two-pair cap, newest-coin auto selection across older groups, explicit SOL fallback, unsigned rejection, exact-message receipt finalization, shared feed, no private fields, concurrent broadcast exclusion, immediate preflight failure, and safe tracking/expiry after lost acknowledgements.');
  console.log('All writes and transaction simulations used localhost. No transaction was broadcast to Solana.');
 }finally{mock.closeAllConnections();await new Promise(resolve=>mock.close(resolve));}

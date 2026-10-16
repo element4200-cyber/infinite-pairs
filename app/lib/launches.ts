@@ -5,6 +5,7 @@ import { Connection, PublicKey, Keypair, TransactionMessage, VersionedTransactio
 import { getAssociatedTokenAddressSync } from '@solana/spl-token';
 import { OnlinePumpSdk, PUMP_SDK, getBuyTokenAmountFromSolAmount, newBondingCurve, bondingCurvePda, PUMP_PROGRAM_ID, GLOBAL_PDA, PUMP_FEE_CONFIG_PDA, QUOTE_CONTROL_PDA } from '@pump-fun/pump-sdk';
 import {createRpcFetch,missingTokenAccount,rpcFailure} from './rpc';
+import {preflightRejection} from './transaction-status';
 import {pairTarget,walletPayload,groupPage,changedGroups} from './groups';
 import { getChatGPTUser } from '../chatgpt-auth';
 import BN from 'bn.js';
@@ -48,6 +49,7 @@ async function finalized(row:Launch){
   ]);
 }
 export async function reconcile(onlyId?:string,groupId?:string){
+  const progress:Record<string,string>={};
   const rows=(await db().prepare('SELECT * FROM triple_launches WHERE active=1'+(onlyId?' AND id=?':groupId?' AND group_id=?':'')+' ORDER BY checked_at LIMIT 12').bind(...(onlyId?[onlyId]:groupId?[groupId]:[])).all<Launch>()).results;
   const candidates:Launch[]=[];
   for(const row of rows){
@@ -55,12 +57,13 @@ export async function reconcile(onlyId?:string,groupId?:string){
     const claim=await db().prepare('UPDATE triple_launches SET checked_at=? WHERE id=? AND checked_at<? AND active=1').bind(Date.now(),row.id,Date.now()-5000).run();
     if(claim.meta.changes)candidates.push(row);
   }
-  if(!candidates.length)return;
+  if(!candidates.length)return progress;
   const rpc=connection(),withSig=candidates.filter(r=>r.signature);
   const statuses=withSig.length?(await rpc.getSignatureStatuses(withSig.map(r=>r.signature!),{searchTransactionHistory:true})).value:[];
   const height=await rpc.getBlockHeight('finalized');
   for(const row of candidates){
     const status=row.signature?statuses[withSig.findIndex(r=>r.id===row.id)]:null;
+    if(status?.confirmationStatus)progress[row.id]=status.confirmationStatus;
     if(status?.confirmationStatus==='finalized'){
       if(status.err){await expire(row,'Transaction failed on Solana');continue;}
       const receipt=await rpc.getTransaction(row.signature!,{commitment:'finalized',maxSupportedTransactionVersion:0});
@@ -82,6 +85,7 @@ export async function reconcile(onlyId?:string,groupId?:string){
       }else await expire(row,'Transaction expired before finalization');
     }
   }
+  return progress;
 }
 export async function feed(){
   let reconciliationError:string|null=null;
@@ -181,7 +185,7 @@ export async function prepare(req: Request) {
     tx.sign([mint]);
     if(tx.serialize().length>1232) throw new Error('This launch exceeds Solana’s transaction size. Shorten the metadata URI or launch without a dev buy.');
     const serialized=Buffer.from(tx.serialize()).toString('base64');
-    const result=await db().prepare("UPDATE triple_launches SET status='prepared', quote_mint=?,quote_symbol=?,fallback=?,depth=?,last_valid=?,\"transaction\"=?,setup_transaction=? WHERE id=? AND status='building' AND active=1").bind(quote.mint.toBase58(),quoteSymbol,fallback,quote.pumpQuote?.depth||0,latest.lastValidBlockHeight,serialized,setupTransaction,id).run();
+    const result=await db().prepare("UPDATE triple_launches SET status='prepared',build_until=0, quote_mint=?,quote_symbol=?,fallback=?,depth=?,last_valid=?,\"transaction\"=?,setup_transaction=? WHERE id=? AND status='building' AND active=1").bind(quote.mint.toBase58(),quoteSymbol,fallback,quote.pumpQuote?.depth||0,latest.lastValidBlockHeight,serialized,setupTransaction,id).run();
     if (!result.meta.changes) throw new Error('Preparation expired. Please try again.');
     return {id,groupId,slot,transaction:serialized,setupTransaction,setupRent,mint:mint.publicKey.toBase58(),name,symbol,predecessor:tail?.mint||null,quoteMint:quote.mint.toBase58(),quoteSymbol,fallback,devBuy,slippage,tokens,lastValidBlockHeight:latest.lastValidBlockHeight,network:'mainnet-beta',maxDevBuy:units.muln(100+slippage).divn(100).toString(),decimals:quote.decimals};
   } catch(e) {
@@ -202,16 +206,38 @@ export async function submit(req: Request) {
   const tx=VersionedTransaction.deserialize(Buffer.from(transaction,'base64')), original=VersionedTransaction.deserialize(Buffer.from(expected,'base64'));
   if (!Buffer.from(tx.message.serialize()).equals(Buffer.from(original.message.serialize()))||!verifyTransaction(tx)) throw new Error('The wallet-signed transaction does not match the launch you reviewed.');
   const sig=base58(tx.signatures[0]);
+  // Reuse the preparation lease field after preparation has completed. A short
+  // database lease prevents competing broadcasts and contradictory preflight outcomes.
+  const lease=Date.now()+20000;
+  const locked=await db().prepare("UPDATE triple_launches SET build_until=? WHERE id=? AND active=1 AND build_until<? RETURNING signature,setup_signature").bind(lease,id,Date.now()).first<{signature:string|null;setup_signature:string|null}>();
+  if(!locked)return {id,signature:sig,status:'submitted',message:'A broadcast is already in progress. Its confirmation is being tracked.'};
+  try{
   if(kind==='setup') await db().prepare('UPDATE triple_launches SET setup_signature=? WHERE id=? AND active=1').bind(sig,id).run();
   else await db().prepare("UPDATE triple_launches SET signature=?,status='submitted' WHERE id=? AND active=1").bind(sig,id).run();
   try { await connection().sendRawTransaction(tx.serialize(),{skipPreflight:false,maxRetries:3}); }
-  catch { return {id,signature:sig,status:'submitted',message:'Broadcast was not acknowledged. Its signature is tracked until finalization or expiry. You can retry the same signed transaction.'}; }
+  catch(e) {
+    const rejection=preflightRejection(e),prior=kind==='setup'?locked.setup_signature:locked.signature;
+    // A definite first-attempt preflight rejection was never broadcast. A failed retry
+    // cannot disprove an earlier ambiguous send, so keep tracking that signature.
+    if(rejection&&!prior){
+      await db().batch([
+        db().prepare("UPDATE triple_launches SET status='failed',active=NULL,slot_key=NULL,error=? WHERE id=? AND active=1").bind(rejection,id),
+        db().prepare("UPDATE triple_groups SET status='failed' WHERE id=? AND status='pending' AND NOT EXISTS(SELECT 1 FROM triple_launches WHERE group_id=? AND active=1)").bind(row.group_id,row.group_id),
+      ]);
+      return {id,signature:sig,status:'failed',message:rejection};
+    }
+    return {id,signature:sig,status:'submitted',message:rejection?rejection+' Checking the earlier submission until its status is definitive.':'Broadcast was not acknowledged. We are checking Solana for this signature. You can safely retry the same signed transaction.'};
+  }
   return {id,signature:sig,status:'submitted'};
+  }finally{await db().prepare('UPDATE triple_launches SET build_until=0 WHERE id=? AND build_until=?').bind(id,lease).run();}
 }
 export function verifyTransaction(tx:VersionedTransaction) {
   return tx.signatures.every((sig,i)=>verify(null,Buffer.from(tx.message.serialize()),createPublicKey({key:Buffer.concat([Buffer.from('302a300506032b6570032100','hex'),tx.message.staticAccountKeys[i].toBuffer()]),format:'der',type:'spki'}),Buffer.from(sig)));
 }
 export async function setupStatus(row:Launch) {
+  // A completed launch proves its lookup table was usable. Do not let a later
+  // setup-status RPC outage hide an already definitive launch result.
+  if(['finalized','failed','expired'].includes(row.status))return {setupReady:row.status==='finalized'&&!!row.setup_signature,setupError:null};
   if(!row.setup_signature) return {setupReady:false,setupError:null};
   const s=(await connection().getSignatureStatuses([row.setup_signature],{searchTransactionHistory:true})).value[0];
   return {setupReady:s?.confirmationStatus==='finalized'&&!s.err,setupError:s?.err?JSON.stringify(s.err):null};
