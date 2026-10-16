@@ -3,14 +3,18 @@ import {markets} from '../../lib/markets';
 import {PublicKey} from '@solana/web3.js';
 import {uploadArtwork,artwork} from '../../lib/artwork';
 import {rpcFailure} from '../../lib/rpc';
+import {archiveRetiredTest} from '../../lib/retired-test';
 import { prepare, submit, feed, olderFeed, creationPage, db, reconcile, publicLaunch, setupStatus, sameOrigin, runtime, type Launch } from '../../lib/launches';
 export const dynamic='force-dynamic';
 const json=(value:unknown,status=200)=>Response.json(value,{status,headers:{'Cache-Control':'no-store'}});
+let testArchived=false;
+async function retireTest(){if(!testArchived){await archiveRetiredTest(db());testArchived=true;}}
 function failure(error:unknown,status:number){const rpc=rpcFailure(error);return rpc?Response.json({error:rpc.message,retryAfter:rpc.retryAfter},{status:503,headers:{'Cache-Control':'no-store','Retry-After':String(rpc.retryAfter)}}):json({error:error instanceof Error?error.message:'Service temporarily unavailable'},status);}
 export async function GET(req:Request) {
   try {
     const url=new URL(req.url), path=url.pathname;
     if(path.startsWith('/api/assets/'))return artwork(path);
+    await retireTest();
     if(path==='/api/available')return json(await availablePage(Math.max(1,Number(url.searchParams.get('before'))||Number.MAX_SAFE_INTEGER)));
     if(path==='/api/markets'){
       const requested=[...new Set((url.searchParams.get('mints')||'').split(',').filter(Boolean))];
@@ -34,6 +38,7 @@ export async function GET(req:Request) {
 export async function POST(req:Request) {
   try {
     const path=new URL(req.url).pathname;
+    await retireTest();
     if(path==='/api/prepare') return json(await prepare(req));
     if(path==='/api/submit') return json(await submit(req));
     if(path==='/api/upload')return json(await uploadArtwork(req));

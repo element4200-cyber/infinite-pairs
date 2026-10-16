@@ -36,6 +36,8 @@ Node.js 22.13+; pnpm 11.25.0. Dependencies are already locked. Use the Sites bui
 
 A funded real launch still requires the user's wallet approval and is not performed by the build agent. Existing on-chain tokens cannot be deleted by resetting a site's board.
 
+The owner retired the single production smoke-test token (`4UsWndN2S53LWU35TLESnaNW6PmKuPdk2GvCUSRQXyzW`). Bounded, idempotent maintenance archives only its exact group/launch IDs when it has no active or finalized pairs. Both sequence values become null so the first public group starts at 001. Receipts, dev-buy history and R2 metadata remain intact. Future tokens named TEST are unaffected. No public reset endpoint is exposed. `tests/retired-test.mjs` checks the real SQL against SQLite, including repeat execution, unrelated records and a group that has acquired a pair.
+
 ## Official pairing reference
 
 [Pump.fun coin quotes and depth rules](https://github.com/pump-fun/pump-public-docs/blob/main/docs/instructions/CREATE_WITH_PUMP_COIN_QUOTE.md)
