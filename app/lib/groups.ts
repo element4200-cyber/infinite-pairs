@@ -62,3 +62,14 @@ export async function changedGroups(ids:string[]){
   const groups=(await db().prepare(`SELECT * FROM triple_groups WHERE status='live' AND id IN (${ids.map(()=>'?').join(',')})`).bind(...ids).all<Group>()).results;
   return decorateGroups(groups);
 }
+export async function availablePage(before=Number.MAX_SAFE_INTEGER){
+  const rows=(await db().prepare(`SELECT g.id AS groupId,g.name AS groupName,g.symbol AS groupSymbol,g.sequence,
+    COALESCE(p.mint,g.mint) AS mint,COALESCE(p.name,g.name) AS name,COALESCE(p.symbol,g.symbol) AS symbol,
+    CASE WHEN p.id IS NULL THEN 1 ELSE 2 END AS slot,CASE WHEN p.id IS NULL THEN 2 ELSE 1 END AS spaces
+    FROM triple_groups g LEFT JOIN triple_launches p ON p.group_id=g.id AND p.slot=1 AND p.status='finalized'
+    WHERE g.status='live' AND g.sequence<? AND NOT EXISTS(
+      SELECT 1 FROM triple_launches l WHERE l.group_id=g.id AND (l.active=1 OR l.slot=2 AND l.status='finalized'))
+    ORDER BY g.sequence DESC LIMIT 81`).bind(before).all()).results;
+  const options=rows.slice(0,80);
+  return {options,hasMore:rows.length>80,nextCursor:options.at(-1)?.sequence??null};
+}

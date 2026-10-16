@@ -1,4 +1,6 @@
-import {importMain} from '../../lib/groups';
+import {importMain,availablePage} from '../../lib/groups';
+import {markets} from '../../lib/markets';
+import {PublicKey} from '@solana/web3.js';
 import {uploadArtwork,artwork} from '../../lib/artwork';
 import {rpcFailure} from '../../lib/rpc';
 import { prepare, submit, feed, olderFeed, creationPage, db, reconcile, publicLaunch, setupStatus, sameOrigin, runtime, type Launch } from '../../lib/launches';
@@ -9,6 +11,16 @@ export async function GET(req:Request) {
   try {
     const url=new URL(req.url), path=url.pathname;
     if(path.startsWith('/api/assets/'))return artwork(path);
+    if(path==='/api/available')return json(await availablePage(Math.max(1,Number(url.searchParams.get('before'))||Number.MAX_SAFE_INTEGER)));
+    if(path==='/api/markets'){
+      const requested=[...new Set((url.searchParams.get('mints')||'').split(',').filter(Boolean))];
+      if(requested.length>30)return json({error:'Request at most 30 tokens.'},400);
+      try{requested.forEach(m=>{if(new PublicKey(m).toBase58()!==m)throw Error();});}catch{return json({error:'Invalid token address.'},400);}
+      if(!requested.length)return json({markets:{}});
+      const marks=requested.map(()=>'?').join(',');
+      const visible=(await db().prepare(`SELECT mint FROM triple_groups WHERE status='live' AND mint IN (${marks}) UNION SELECT mint FROM triple_launches WHERE status='finalized' AND mint IN (${marks})`).bind(...requested,...requested).all<{mint:string}>()).results;
+      return json({markets:await markets(visible.map(t=>t.mint))});
+    }
     if(path==='/api/feed') return json(url.searchParams.has('before')?await olderFeed(Math.max(1,Number(url.searchParams.get('before'))||1)):await feed());
     if(path==='/api/creations')return json(await creationPage(Math.max(1,Number(url.searchParams.get('before'))||Number.MAX_SAFE_INTEGER)));
     if(path.startsWith('/api/launch/')) {

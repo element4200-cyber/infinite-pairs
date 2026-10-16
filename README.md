@@ -6,7 +6,11 @@ Create a main coin with SOL as its quote, or add a live Pump.fun CA using a wall
 
 Auto-pair chooses the most recently created eligible predecessor in a live group with a free position and no active reservation. It never adds a fourth coin or changes the group of an already prepared transaction. Each token's actual Pump.fun quote and visible predecessor are separate fields. The official Pump.fun SDK resolves eligible custom quotes, including live depth limits. An ineligible quote falls back to SOL, disclosed in wallet review and token details. Optional dev buys use the actual quote currency.
 
-The public Tokens launched board has Groups, New creations and Open slots menus, search, copied CAs, real Pump.fun links and pagination. New creations and old groups with recent pair activity refresh automatically. Pending and failed transactions are excluded from verified launch totals. Imports count as main coins, not tokens launched here.
+Below the hero logo, the three controls are **Create a New main coin**, **Auto pair** with a live available-token dropdown, and **Add an existing CA**. The dropdown includes current predecessors, remaining spaces and next-slot numbers; pagination reaches older open groups. Complete and actively reserved groups are excluded. The server revalidates the selected slot before reserving it.
+
+The public Tokens launched board has Groups, New creations and Open slots menus, search, copied CAs, labeled Pump.fun links and independent pagination. The visible board polls every four seconds, refreshes on focus, and reconciles exact finalized receipts. Submitted roots appear as verification-in-progress; pairs unlock after finalization. New creations and old groups with recent pair activity refresh automatically. Pending and failed transactions are excluded from verified launch totals. Imports count as main coins, not tokens launched here.
+
+All token cards and details display USD market caps from Pump.fun's `coins-v2` data with DEX Screener's reported `marketCap` as fallback. FDV is never substituted. Visible cards request batches of up to 30 stored public mints; quotes refresh every 30 seconds with bounded concurrency and short per-isolate data caching. Missing/indexing data is labeled unavailable, failed refreshes are labeled delayed, and values older than five minutes are hidden. Market outages do not block launches or the group feed. No additional API key is needed.
 
 ## Storage and security
 
@@ -25,6 +29,8 @@ Node.js 22.13+; pnpm 11.25.0. Dependencies are already locked. Use the Sites bui
 `tests/triple-flow.mjs` requires a **fresh isolated localhost** D1/R2 preview with `SOLANA_RPC_URL=http://127.0.0.1:4199`. It caches one read-only batch of public Pump configuration into ignored `.wrangler/`, then simulates all token accounts, transactions and finalization on a localhost RPC server. It tests CA verification, authorization, two-slot ordering, duplicate CA and occupied-slot rejection, concurrent wallet races, independent groups, main/SOL launch preparation with a dev buy, newest-predecessor selection, unsigned rejection and message-matched receipt finalization. All writes and signed test transactions stay on localhost; none are sent to Solana.
 
 `tests/triple-pagination.mjs` additionally verifies old archive isolation, every creation across pages, and updates to older groups using disposable synthetic localhost rows. It refuses hosted URLs and non-local DB paths. Never apply test fixtures to the hosted database. Older test files describing the superseded single-chain model are historical and are not the Triple Pairs acceptance tests.
+
+`node --experimental-strip-types tests/markets.mjs` checks provider field validation, base/quote attribution, fallback, caching and outages without network calls. Pagination tests also cover the available-token dropdown across more than 80 open groups and reject unlisted/invalid/oversized market lookups. `tests/market-provider.mjs` optionally checks a real public mint through the localhost Worker using explicit `TEST_DB` and `TEST_MARKET_MINT`; its temporary local group is always removed.
 
 A funded real launch still requires the user's wallet approval and is not performed by the build agent. Existing on-chain tokens cannot be deleted by resetting a site's board.
 

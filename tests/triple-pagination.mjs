@@ -15,7 +15,7 @@ function launch(data){const row={...baseline,...data};insert.run(...columns.map(
 async function get(url){const r=await fetch(origin+url);assert.equal(r.status,200);return r.json();}
 try{
  db.exec('BEGIN');
- for(let i=0;i<67;i++){
+ for(let i=0;i<87;i++){
   const id='pagination-group-'+i,mint=Keypair.generate().publicKey.toBase58(),now=Date.now()-10000+i;
   db.prepare("INSERT INTO triple_groups(id,mint,name,symbol,owner,source,status,sequence,created_at,finalized_at) VALUES(?,?,?,'LOCAL','synthetic-local-wallet','synthetic','live',?,?,?)").run(id,mint,'LOCAL PAGINATION '+i,1000+i,now,now);
   launch({id:'pagination-launch-'+i,auth_hash:'pagination-auth-'+i,group_id:id,slot:0,slot_key:id+':0',mint,name:'LOCAL PAGINATION '+i,sequence:1000+i,predecessor:null,active:null,checked_at:0});
@@ -27,11 +27,20 @@ try{
  assert(first.updatedGroups.some(g=>g.id===oldGroup.id&&g.tokens.some(t=>t.name==='LOCAL OLD GROUP UPDATE')),'New pair activity updates older groups outside the first page');
  const groupIds=new Set(first.groups.map(g=>g.id));let page=first;
  while(page.hasMore){page=await get('/api/feed?before='+page.nextCursor);for(const g of page.groups){assert(!groupIds.has(g.id));groupIds.add(g.id);}}
- assert.equal(groupIds.size,originalGroups+67,'All groups are reachable without gaps');
+ assert.equal(groupIds.size,originalGroups+87,'All groups are reachable without gaps');
  const creationIds=new Set(first.launches.map(t=>t.id));page=first;
  while(page.hasMoreCreations){page=await get('/api/creations?before='+page.nextCreationCursor);for(const t of page.launches){assert(!creationIds.has(t.id));creationIds.add(t.id);}}
- assert.equal(creationIds.size,originalLaunches+68,'All creations are reachable without gaps');
- console.log('PASS: independent group and creation pagination, no duplicate/gapped entries, older-group live updates, and no archived CA in the current feed. Fixtures are localhost-only.');
+ assert.equal(creationIds.size,originalLaunches+88,'All creations are reachable without gaps');
+ let available=await get('/api/available');assert.equal(available.options.length,80);assert.equal(available.hasMore,true);
+ const options=[...available.options];while(available.hasMore){available=await get('/api/available?before='+available.nextCursor);options.push(...available.options);}
+ assert.equal(new Set(options.map(o=>o.groupId)).size,options.length,'No duplicate available groups');
+ assert.equal(options.filter(o=>o.groupId.startsWith('pagination-group-')).length,87,'Open groups beyond the first page remain selectable');
+ assert(!options.some(o=>o.groupId===oldGroup.id),'Complete groups are not available');
+ for(const o of options){assert.equal(o.spaces,3-o.slot);assert([1,2].includes(o.slot));}
+ const unknown=await get('/api/markets?mints='+Keypair.generate().publicKey.toBase58());assert.deepEqual(unknown.markets,{},'Unlisted addresses cannot trigger provider lookups');
+ assert.equal((await fetch(origin+'/api/markets?mints=not-a-ca')).status,400);
+ assert.equal((await fetch(origin+'/api/markets?mints='+Array.from({length:31},()=>Keypair.generate().publicKey.toBase58()).join(','))).status,400);
+ console.log('PASS: group, creation, and available-token pagination; older-group live updates; correct remaining slots; complete groups excluded; market lookup validation; no archived CA. Fixtures are localhost-only.');
 }finally{
  if(db.isTransaction)db.exec('ROLLBACK');
  db.exec('BEGIN');db.prepare("DELETE FROM triple_launches WHERE id LIKE 'pagination-%'").run();db.prepare("DELETE FROM triple_groups WHERE id LIKE 'pagination-%'").run();db.prepare('DELETE FROM chain_config WHERE id=9000').run();db.exec('COMMIT');db.close();
