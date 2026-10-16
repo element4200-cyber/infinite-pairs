@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Infinite Pairs — Every launch, connected.",
-  description: "Launch on Pump.fun. Connect to the token before you.",
+  title: "Triple Pairs — One main. Two pairs.",
+  description: "Create a main coin on Pump.fun, launch its first pair, then pair the pair. Every creation has its own place.",
   icons: {
     icon: "/favicon.svg",
     shortcut: "/favicon.svg",

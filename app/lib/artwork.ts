@@ -15,7 +15,7 @@ export async function uploadArtwork(req:Request){
   const file=form.get('file'),payload=form.get('payload'),signature=form.get('signature');
   if(!(file instanceof File)||file.size>limit||file.size===0||typeof payload!=='string'||payload.length>10000||typeof signature!=='string'||signature.length>100)throw new Error('Choose a PNG, JPEG, WebP, or GIF smaller than 4 MB.');
   const p=JSON.parse(payload),user=new PublicKey(p.wallet);
-  if(p.domain!==new URL(req.url).origin||p.action!=='Upload Infinite Pairs artwork'||!Number.isFinite(p.timestamp)||Math.abs(Date.now()-p.timestamp)>300000)throw new Error('Artwork authorization expired. Please try again.');
+  if(p.domain!==new URL(req.url).origin||p.action!=='Upload Triple Pairs artwork'||!Number.isFinite(p.timestamp)||Math.abs(Date.now()-p.timestamp)>300000)throw new Error('Artwork authorization expired. Please try again.');
   const key=createPublicKey({key:Buffer.concat([Buffer.from('302a300506032b6570032100','hex'),user.toBuffer()]),format:'der',type:'spki'});
   if(!verify(null,Buffer.from(payload),key,Buffer.from(signature,'base64')))throw new Error('Artwork wallet authorization failed.');
   const {name,symbol,description=''}=p;

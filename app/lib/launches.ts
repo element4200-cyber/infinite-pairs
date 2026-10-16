@@ -5,56 +5,20 @@ import { Connection, PublicKey, Keypair, TransactionMessage, VersionedTransactio
 import { getAssociatedTokenAddressSync } from '@solana/spl-token';
 import { OnlinePumpSdk, PUMP_SDK, getBuyTokenAmountFromSolAmount, newBondingCurve, bondingCurvePda, PUMP_PROGRAM_ID, GLOBAL_PDA, PUMP_FEE_CONFIG_PDA, QUOTE_CONTROL_PDA } from '@pump-fun/pump-sdk';
 import {createRpcFetch,missingTokenAccount,rpcFailure} from './rpc';
+import {pairTarget,walletPayload,groupPage,changedGroups} from './groups';
 import { getChatGPTUser } from '../chatgpt-auth';
 import BN from 'bn.js';
-import { SOL, ROOT_NAME, ROOT_SYMBOL, baseUnits, fallbackReason, validUri, base58 } from './rules';
+import { SOL, baseUnits, fallbackReason, validUri, base58 } from './rules';
 export type Launch = {
-  id: string; auth_hash: string; owner: string; mint: string; name: string; symbol: string; uri: string;
+  id: string; group_id:string; slot:number; slot_key:string|null; checked_at:number; auth_hash: string; owner: string; mint: string; name: string; symbol: string; uri: string;
   description: string; image: string; predecessor: string | null; quote_mint: string; quote_symbol: string;
   fallback: string | null; depth: number; dev_buy: string; slippage: number; sequence: number | null;
   status: string; active: number | null; created_at: number; finalized_at: number | null; build_until: number;
   last_valid: number | null; transaction: string | null; signature: string | null; error: string | null;
   setup_transaction: string | null; setup_signature: string | null;
 };
-type Runtime = { DB?: D1Database; BUCKET?: R2Bucket; SITE_OWNER_EMAIL?: string; SOLANA_RPC_URL?: string; STARTING_TOKEN_CA?: string };
-export type BaseToken={mint:string;name:string;symbol:string};
-type Activation={status:'awaiting-ca'|'waiting-for-token'|'active'|'invalid-ca'|'verification-delayed';mint?:string};
-export async function startingToken():Promise<{base:BaseToken|null;activation:Activation}>{
-  const saved=await db().prepare('SELECT mint,name,symbol FROM chain_config WHERE id=1').first<BaseToken>();
-  if(saved)return {base:saved,activation:{status:'active',mint:saved.mint}};
-  const candidate=runtime().STARTING_TOKEN_CA?.trim();
-  if(!candidate)return {base:null,activation:{status:'awaiting-ca'}};
-  let key:PublicKey;
-  try{key=new PublicKey(candidate);}catch{return {base:null,activation:{status:'invalid-ca'}};}
-  const mint=key.toBase58();
-  try{
-    const account=await connection().getAccountInfo(bondingCurvePda(key),'finalized');
-    if(!account)return {base:null,activation:{status:'waiting-for-token',mint}};
-    if(!account.owner.equals(PUMP_PROGRAM_ID))return {base:null,activation:{status:'invalid-ca',mint}};
-    try{PUMP_SDK.decodeBondingCurve(account);}catch{return {base:null,activation:{status:'invalid-ca',mint}};}
-  }catch{return {base:null,activation:{status:'verification-delayed',mint}};}
-  // Runtime configuration is owner-controlled. Never replace an existing root or live chain.
-  await db().prepare("INSERT INTO chain_config(id,mint,name,symbol,configured_by,updated_at) SELECT 1,?,?,?,?,? WHERE NOT EXISTS(SELECT 1 FROM launches WHERE status='finalized' OR active=1) ON CONFLICT(id) DO NOTHING")
-    .bind(mint,ROOT_NAME,ROOT_SYMBOL,'owner-runtime',Date.now()).run();
-  const base=await db().prepare('SELECT mint,name,symbol FROM chain_config WHERE id=1').first<BaseToken>();
-  return {base,activation:{status:base?'active':'verification-delayed',mint:base?.mint||mint}};
-}
-export async function baseToken(){return (await startingToken()).base;}
+type Runtime = { DB?: D1Database; BUCKET?: R2Bucket; SITE_OWNER_EMAIL?: string; SOLANA_RPC_URL?: string };
 export async function ownerStatus(){const user=await getChatGPTUser();return {owner:!!user&&!!runtime().SITE_OWNER_EMAIL&&user.email.toLowerCase()===runtime().SITE_OWNER_EMAIL!.toLowerCase(),signedIn:!!user};}
-export async function setBase(req:Request){
-  sameOrigin(req);
-  if(!(await ownerStatus()).owner) throw new Error('Only the signed-in site owner can configure the starting CA.');
-  const {mint}=await req.json() as {mint:string}; const key=new PublicKey(mint);
-  const account=await connection().getAccountInfo(bondingCurvePda(key),'finalized');
-  if(!account||!account.owner.equals(PUMP_PROGRAM_ID)) throw new Error('This CA is not a live Pump.fun token on Solana mainnet.');
-  PUMP_SDK.decodeBondingCurve(account);
-  const user=await getChatGPTUser();
-  const guard="NOT EXISTS(SELECT 1 FROM launches WHERE status='finalized' OR active=1)";
-  const result=await db().prepare(`INSERT INTO chain_config(id,mint,name,symbol,configured_by,updated_at) SELECT 1,?,?,?,?,? WHERE ${guard} ON CONFLICT(id) DO UPDATE SET mint=excluded.mint,name=excluded.name,symbol=excluded.symbol,configured_by=excluded.configured_by,updated_at=excluded.updated_at WHERE ${guard}`)
-    .bind(key.toBase58(),ROOT_NAME,ROOT_SYMBOL,user!.userId,Date.now()).run();
-  if(!result.meta.changes) throw new Error('The starting CA is locked once a launch is active or finalized.');
-  return {base:await baseToken()};
-}
 export const runtime = () => env as Runtime;
 export function db() { const db = runtime().DB; if (!db) throw new Error('Shared launch storage is unavailable.'); return db; }
 export function connection() {
@@ -64,82 +28,81 @@ export function connection() {
   });
 }
 export function publicLaunch(row: Launch) {
-  const { transaction, setup_transaction, auth_hash, active, build_until, last_valid, ...safe } = row;
+  const { transaction, setup_transaction, auth_hash, active, build_until, last_valid, slot_key, checked_at, ...safe } = row;
   return safe;
 }
 export function sameOrigin(req: Request) {
   const origin = req.headers.get('origin');
   if (!origin || origin !== new URL(req.url).origin) throw new Error('Open the app directly to submit a launch.');
 }
-const recentChecks=new Map<string,number>();
-export async function reconcile(force=false) {
-  const row = await db().prepare('SELECT * FROM launches WHERE active = 1').first<Launch>();
-  if (!row) return;
-  if (row.status === 'building') {
-    if (row.build_until < Date.now()) await db().prepare("UPDATE launches SET status='expired', active=NULL, error='Preparation timed out' WHERE id=? AND status='building'").bind(row.id).run();
-    return;
+async function expire(row:Launch,message:string){
+  await db().batch([
+    db().prepare("UPDATE triple_launches SET status='expired',active=NULL,slot_key=NULL,error=? WHERE id=? AND active=1").bind(message,row.id),
+    db().prepare("UPDATE triple_groups SET status='expired' WHERE id=? AND status='pending' AND NOT EXISTS(SELECT 1 FROM triple_launches WHERE group_id=? AND active=1)").bind(row.group_id,row.group_id),
+  ]);
+}
+async function finalized(row:Launch){
+  await db().batch([
+    db().prepare("UPDATE triple_launches SET status='finalized',active=NULL,finalized_at=?,sequence=(SELECT COALESCE(MAX(sequence),0)+1 FROM triple_launches WHERE status='finalized') WHERE id=? AND active=1").bind(Date.now(),row.id),
+    db().prepare("UPDATE triple_groups SET status='live',finalized_at=?,sequence=(SELECT COALESCE(MAX(sequence),0)+1 FROM triple_groups) WHERE id=? AND status='pending' AND EXISTS(SELECT 1 FROM triple_launches WHERE id=? AND status='finalized' AND slot=0)").bind(Date.now(),row.group_id,row.id),
+  ]);
+}
+export async function reconcile(onlyId?:string,groupId?:string){
+  const rows=(await db().prepare('SELECT * FROM triple_launches WHERE active=1'+(onlyId?' AND id=?':groupId?' AND group_id=?':'')+' ORDER BY checked_at LIMIT 12').bind(...(onlyId?[onlyId]:groupId?[groupId]:[])).all<Launch>()).results;
+  const candidates:Launch[]=[];
+  for(const row of rows){
+    if(row.status==='building'){if(row.build_until<Date.now())await expire(row,'Preparation timed out');continue;}
+    const claim=await db().prepare('UPDATE triple_launches SET checked_at=? WHERE id=? AND checked_at<? AND active=1').bind(Date.now(),row.id,Date.now()-5000).run();
+    if(claim.meta.changes)candidates.push(row);
   }
-  // The feed and pending dialog both poll; share a short verification window.
-  if(!force&&Date.now()-(recentChecks.get(row.id)??0)<4000)return;
-  if(recentChecks.size>8)recentChecks.clear();recentChecks.set(row.id,Date.now());
-  const rpc = connection();
-  if (row.signature) {
-    const status = (await rpc.getSignatureStatuses([row.signature], { searchTransactionHistory: true })).value[0];
-    if (status?.confirmationStatus === 'finalized') {
-      if (status.err) {
-        await db().prepare("UPDATE launches SET status='failed', active=NULL, error=? WHERE id=? AND active=1").bind(JSON.stringify(status.err), row.id).run();
-        return;
-      }
-      const receipt = await rpc.getTransaction(row.signature, { commitment: 'finalized', maxSupportedTransactionVersion: 0 });
-      if (!receipt || receipt.meta?.err || !row.transaction) return;
-      const prepared = VersionedTransaction.deserialize(Buffer.from(row.transaction, 'base64'));
-      if (!Buffer.from(receipt.transaction.message.serialize()).equals(Buffer.from(prepared.message.serialize()))) throw new Error('Transaction receipt does not match this launch.');
-      await db().prepare("UPDATE launches SET status='finalized', active=NULL, finalized_at=?, sequence=(SELECT COALESCE(MAX(sequence),0)+1 FROM launches WHERE status='finalized') WHERE id=? AND active=1").bind(Date.now(), row.id).run();
-      return;
+  if(!candidates.length)return;
+  const rpc=connection(),withSig=candidates.filter(r=>r.signature);
+  const statuses=withSig.length?(await rpc.getSignatureStatuses(withSig.map(r=>r.signature!),{searchTransactionHistory:true})).value:[];
+  const height=await rpc.getBlockHeight('finalized');
+  for(const row of candidates){
+    const status=row.signature?statuses[withSig.findIndex(r=>r.id===row.id)]:null;
+    if(status?.confirmationStatus==='finalized'){
+      if(status.err){await expire(row,'Transaction failed on Solana');continue;}
+      const receipt=await rpc.getTransaction(row.signature!,{commitment:'finalized',maxSupportedTransactionVersion:0});
+      if(!receipt||receipt.meta?.err||!row.transaction)continue;
+      const prepared=VersionedTransaction.deserialize(Buffer.from(row.transaction,'base64'));
+      if(!Buffer.from(receipt.transaction.message.serialize()).equals(Buffer.from(prepared.message.serialize())))throw new Error('Transaction receipt does not match this launch.');
+      await finalized(row);continue;
     }
-  }
-  // A signed slot is never released by elapsed time while it can still land.
-  if (row.last_valid && await rpc.getBlockHeight('finalized') > row.last_valid) {
-    if (await rpc.getAccountInfo(new PublicKey(row.mint), 'finalized')) {
-      // Recover a transaction broadcast outside this app after wallet signing.
-      for (const candidate of await rpc.getSignaturesForAddress(new PublicKey(row.mint), {limit:20}, 'finalized')) {
-        if (candidate.err) continue;
-        const receipt = await rpc.getTransaction(candidate.signature,{commitment:'finalized',maxSupportedTransactionVersion:0});
-        const prepared = VersionedTransaction.deserialize(Buffer.from(row.transaction!,'base64'));
-        if(receipt && !receipt.meta?.err && Buffer.from(receipt.transaction.message.serialize()).equals(Buffer.from(prepared.message.serialize()))) {
-          await db().prepare('UPDATE launches SET signature=? WHERE id=? AND active=1').bind(candidate.signature,row.id).run();
-          break;
+    if(row.last_valid&&height>row.last_valid){
+      if(await rpc.getAccountInfo(new PublicKey(row.mint),'finalized')){
+        for(const candidate of await rpc.getSignaturesForAddress(new PublicKey(row.mint),{limit:20},'finalized')){
+          if(candidate.err)continue;
+          const receipt=await rpc.getTransaction(candidate.signature,{commitment:'finalized',maxSupportedTransactionVersion:0});
+          const prepared=VersionedTransaction.deserialize(Buffer.from(row.transaction!,'base64'));
+          if(receipt&&!receipt.meta?.err&&Buffer.from(receipt.transaction.message.serialize()).equals(Buffer.from(prepared.message.serialize()))){
+            await db().prepare('UPDATE triple_launches SET signature=? WHERE id=? AND active=1').bind(candidate.signature,row.id).run();await finalized(row);break;
+          }
         }
-      }
-      return;
+      }else await expire(row,'Transaction expired before finalization');
     }
-    await db().prepare("UPDATE launches SET status='expired', active=NULL, error='Transaction expired before finalization' WHERE id=? AND active=1").bind(row.id).run();
   }
 }
-export async function feed() {
+export async function feed(){
   let reconciliationError:string|null=null;
-  try{await reconcile();}catch{reconciliationError='Solana verification is temporarily delayed. Existing launches remain visible.';}
-  const rows = await db().prepare("SELECT * FROM launches WHERE status='finalized' ORDER BY sequence DESC LIMIT 101").all<Launch>();
-  const total = await db().prepare("SELECT COUNT(*) AS n FROM launches WHERE status='finalized'").first<{ n: number }>();
-  const tail = rows.results[0] || null;
-  const active = await db().prepare('SELECT id,status FROM launches WHERE active=1').first();
-  const pending=await db().prepare("SELECT * FROM launches WHERE active=1 AND status='submitted'").first<Launch>();
-  return { launches: rows.results.slice(0,100).map(publicLaunch), hasMore: rows.results.length>100, total: total?.n || 0, tail: tail ? publicLaunch(tail) : null, ...await startingToken(), pending:pending?publicLaunch(pending):null, active, uploads: !!runtime().BUCKET, network: 'mainnet-beta',reconciliationError,...await ownerStatus() };
+  try{await reconcile();}catch{reconciliationError='Solana verification is temporarily delayed. Existing creations remain visible.';}
+  const page=await groupPage();
+  const creations=await creationPage();
+  const updatedIds=[...new Set(creations.launches.map(t=>t.group_id))].filter(id=>!page.groups.some(g=>g.id===id));
+  const updatedGroups=await changedGroups(updatedIds);
+  const pending=(await db().prepare("SELECT * FROM triple_launches WHERE active=1 AND status!='building' ORDER BY created_at DESC LIMIT 30").all<Launch>()).results.map(publicLaunch);
+  const counts=await db().prepare("SELECT (SELECT COUNT(*) FROM triple_groups WHERE status='live') AS groups,(SELECT COUNT(*) FROM triple_launches WHERE status='finalized') AS launches,(SELECT COUNT(*) FROM triple_launches WHERE status='finalized' AND slot>0) AS pairs").first<{groups:number;launches:number;pairs:number}>();
+  const open=await db().prepare("SELECT COUNT(*) AS n FROM triple_groups g WHERE g.status='live' AND NOT EXISTS(SELECT 1 FROM triple_launches l WHERE l.group_id=g.id AND (l.slot=2 AND l.status='finalized' OR l.active=1))").first<{n:number}>();
+  return {...page,...creations,updatedGroups,pending,total:counts?.launches||0,totalGroups:counts?.groups||0,totalPairs:counts?.pairs||0,openGroups:open?.n||0,uploads:!!runtime().BUCKET,reconciliationError,network:'mainnet-beta',...await ownerStatus()};
 }
-export async function olderFeed(before: number) {
-  const rows = await db().prepare("SELECT * FROM launches WHERE status='finalized' AND sequence<? ORDER BY sequence DESC LIMIT 101").bind(before).all<Launch>();
-  return { launches: rows.results.slice(0,100).map(publicLaunch), hasMore: rows.results.length>100 };
+export async function creationPage(before=Number.MAX_SAFE_INTEGER){
+  const rows=(await db().prepare("SELECT * FROM triple_launches WHERE status='finalized' AND sequence<? ORDER BY sequence DESC LIMIT 61").bind(before).all<Launch>()).results;
+  const launches=rows.slice(0,60).map(publicLaunch);
+  return {launches,hasMoreCreations:rows.length>60,nextCreationCursor:launches.at(-1)?.sequence??null};
 }
+export async function olderFeed(before:number){return groupPage(before);}
 export async function prepare(req: Request) {
-  sameOrigin(req);
-  const body = await req.text(); if(body.length>20000) throw new Error('Launch request is too large.');
-  const { payload, signature } = JSON.parse(body) as { payload: string; signature: string };
-  if (typeof payload !== 'string' || payload.length > 12000 || typeof signature !== 'string' || signature.length>100) throw new Error('Invalid wallet authorization.');
-  const p = JSON.parse(payload);
-  if (p.domain !== new URL(req.url).origin || p.action !== 'Prepare Infinite Pairs launch' || !Number.isFinite(p.timestamp) || Math.abs(Date.now()-p.timestamp)>300000) throw new Error('Wallet authorization expired. Please try again.');
-  const user = new PublicKey(p.wallet);
-  const publicKey = createPublicKey({ key: Buffer.concat([Buffer.from('302a300506032b6570032100','hex'), user.toBuffer()]), format: 'der', type: 'spki' });
-  if (!verify(null, Buffer.from(payload), publicKey, Buffer.from(signature,'base64'))) throw new Error('Wallet authorization failed.');
+  const {p,payload,user}=await walletPayload(req,'Prepare Triple Pairs launch');
   const {name,symbol,uri,description='',image='',devBuy='0',slippage=1}=p;
   if (typeof name!=='string'||!name.trim()||Buffer.byteLength(name)>32||typeof symbol!=='string'||!symbol.trim()||Buffer.byteLength(symbol)>13) throw new Error('Use a name up to 32 bytes and a ticker up to 13 bytes.');
   if (typeof uri!=='string'||uri.length>200) throw new Error('Import a token image before preparing the launch.');
@@ -153,16 +116,21 @@ export async function prepare(req: Request) {
   if (image && !image.startsWith(assetPrefix)) throw new Error('Import an image using this app.');
   if (typeof devBuy!=='string'||!Number.isInteger(slippage)||slippage<0||slippage>10) throw new Error('Invalid dev-buy or slippage setting.');
   baseUnits(devBuy,9);
-  await reconcile(true);
-  const last = await db().prepare("SELECT * FROM launches WHERE status='finalized' ORDER BY sequence DESC LIMIT 1").first<Launch>();
-  const tail=last||await baseToken();
-  if(!tail) throw new Error('Launching opens automatically after the starting CA is supplied and verified live on Pump.fun.');
-  const id=crypto.randomUUID(), mint=Keypair.generate(), authHash=createHash('sha256').update(payload).digest('hex');
-  try {
-    // The unique active slot serializes all wallets; terminal rows use NULL.
-    await db().prepare("INSERT INTO launches (id,auth_hash,owner,mint,name,symbol,uri,description,image,predecessor,dev_buy,slippage,status,active,created_at,build_until) SELECT ?,?,?,?,?,?,?,?,?,?,?,?,'building',1,?,? WHERE COALESCE((SELECT mint FROM launches WHERE status='finalized' ORDER BY sequence DESC LIMIT 1),(SELECT mint FROM chain_config WHERE id=1))=?")
-      .bind(id,authHash,user.toBase58(),mint.publicKey.toBase58(),name,symbol,uri,description,image,tail?.mint||null,devBuy,slippage,Date.now(),Date.now()+60000,tail?.mint||'').run().then(r=>{if(!r.meta.changes) throw new Error('Chain changed');});
-  } catch { throw new Error('Another launch is being finalized, or this authorization was already used. Wait for the next slot and try again.'); }
+  if(!['main','pair','auto'].includes(p.mode))throw new Error('Choose a new main coin or an available pair slot.');
+  if(p.mode!=='main')await reconcile(undefined,typeof p.groupId==='string'?p.groupId:undefined);
+  const target=p.mode==='main'?null:await pairTarget(p);
+  const tail=target?.predecessor||null,groupId=target?.group.id||crypto.randomUUID(),slot=target?.slot??0;
+  const id=crypto.randomUUID(),mint=Keypair.generate(),authHash=createHash('sha256').update(payload).digest('hex'),now=Date.now();
+  const reservation=db().prepare("INSERT INTO triple_launches(id,auth_hash,group_id,slot,slot_key,owner,mint,name,symbol,uri,description,image,predecessor,dev_buy,slippage,status,active,created_at,build_until) SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'building',1,?,? WHERE EXISTS(SELECT 1 FROM triple_groups WHERE id=? AND status=?) AND (?=0 OR (?=1 AND NOT EXISTS(SELECT 1 FROM triple_launches WHERE group_id=? AND slot>0 AND status='finalized')) OR (?=2 AND EXISTS(SELECT 1 FROM triple_launches WHERE group_id=? AND slot=1 AND status='finalized' AND mint=?)))")
+    .bind(id,authHash,groupId,slot,groupId+':'+slot,user.toBase58(),mint.publicKey.toBase58(),name,symbol,uri,description,image,tail?.mint||null,devBuy,slippage,now,now+60000,groupId,slot===0?'pending':'live',slot,slot,groupId,slot,groupId,tail?.mint||'');
+  try{
+    if(slot===0){
+      const results=await db().batch([
+        db().prepare("INSERT INTO triple_groups(id,mint,name,symbol,image,description,owner,source,status,created_at) SELECT ?,?,?,?,?,?,?,'launched','pending',? WHERE (SELECT COUNT(*) FROM triple_groups WHERE owner=? AND created_at>?)<10").bind(groupId,mint.publicKey.toBase58(),name,symbol,image,description,user.toBase58(),now,user.toBase58(),now-600000),reservation,
+      ]);
+      if(!results[1].meta.changes)throw new Error('Main coin limit reached.');
+    }else if(!(await reservation.run()).meta.changes)throw new Error('Group changed');
+  }catch{throw new Error('This slot is reserved, already filled, or you already have a pending launch. Refresh and choose an open slot.');}
   try {
     const rpc=connection(), online=new OnlinePumpSdk(rpc);
     // Fetch public Pump configuration in one RPC call instead of three concurrent calls.
@@ -213,11 +181,12 @@ export async function prepare(req: Request) {
     tx.sign([mint]);
     if(tx.serialize().length>1232) throw new Error('This launch exceeds Solana’s transaction size. Shorten the metadata URI or launch without a dev buy.');
     const serialized=Buffer.from(tx.serialize()).toString('base64');
-    const result=await db().prepare("UPDATE launches SET status='prepared', quote_mint=?,quote_symbol=?,fallback=?,depth=?,last_valid=?,\"transaction\"=?,setup_transaction=? WHERE id=? AND status='building' AND active=1").bind(quote.mint.toBase58(),quoteSymbol,fallback,quote.pumpQuote?.depth||0,latest.lastValidBlockHeight,serialized,setupTransaction,id).run();
+    const result=await db().prepare("UPDATE triple_launches SET status='prepared', quote_mint=?,quote_symbol=?,fallback=?,depth=?,last_valid=?,\"transaction\"=?,setup_transaction=? WHERE id=? AND status='building' AND active=1").bind(quote.mint.toBase58(),quoteSymbol,fallback,quote.pumpQuote?.depth||0,latest.lastValidBlockHeight,serialized,setupTransaction,id).run();
     if (!result.meta.changes) throw new Error('Preparation expired. Please try again.');
-    return {id,transaction:serialized,setupTransaction,setupRent,mint:mint.publicKey.toBase58(),name,symbol,predecessor:tail?.mint||null,quoteMint:quote.mint.toBase58(),quoteSymbol,fallback,devBuy,slippage,tokens,lastValidBlockHeight:latest.lastValidBlockHeight,network:'mainnet-beta',maxDevBuy:units.muln(100+slippage).divn(100).toString(),decimals:quote.decimals};
+    return {id,groupId,slot,transaction:serialized,setupTransaction,setupRent,mint:mint.publicKey.toBase58(),name,symbol,predecessor:tail?.mint||null,quoteMint:quote.mint.toBase58(),quoteSymbol,fallback,devBuy,slippage,tokens,lastValidBlockHeight:latest.lastValidBlockHeight,network:'mainnet-beta',maxDevBuy:units.muln(100+slippage).divn(100).toString(),decimals:quote.decimals};
   } catch(e) {
-    await db().prepare("UPDATE launches SET status='failed',active=NULL,error=? WHERE id=? AND status='building'").bind(rpcFailure(e)?.message||(e instanceof Error?e.message:'Preparation failed'),id).run();
+    await db().prepare("UPDATE triple_launches SET status='failed',active=NULL,slot_key=NULL,error=? WHERE id=? AND status='building'").bind(rpcFailure(e)?.message||(e instanceof Error?e.message:'Preparation failed'),id).run();
+    if(slot===0)await db().prepare("UPDATE triple_groups SET status='failed' WHERE id=? AND status='pending'").bind(groupId).run();
     throw e;
   }
 }
@@ -226,15 +195,15 @@ export async function submit(req: Request) {
   const body=await req.text(); if(body.length>8000) throw new Error('Invalid signed transaction.');
   const {id,transaction,kind}=JSON.parse(body) as {id:string;transaction:string;kind?:string};
   if (typeof transaction!=='string'||transaction.length>5000) throw new Error('Invalid signed transaction.');
-  const row=await db().prepare('SELECT * FROM launches WHERE id=?').bind(id).first<Launch>();
+  const row=await db().prepare('SELECT * FROM triple_launches WHERE id=?').bind(id).first<Launch>();
   if (!row||!row.transaction||!['prepared','submitted'].includes(row.status)) throw new Error('Launch slot is no longer available.');
   const expected=kind==='setup'?row.setup_transaction:row.transaction;
   if(!expected) throw new Error('No setup transaction is required.');
   const tx=VersionedTransaction.deserialize(Buffer.from(transaction,'base64')), original=VersionedTransaction.deserialize(Buffer.from(expected,'base64'));
   if (!Buffer.from(tx.message.serialize()).equals(Buffer.from(original.message.serialize()))||!verifyTransaction(tx)) throw new Error('The wallet-signed transaction does not match the launch you reviewed.');
   const sig=base58(tx.signatures[0]);
-  if(kind==='setup') await db().prepare('UPDATE launches SET setup_signature=? WHERE id=? AND active=1').bind(sig,id).run();
-  else await db().prepare("UPDATE launches SET signature=?,status='submitted' WHERE id=? AND active=1").bind(sig,id).run();
+  if(kind==='setup') await db().prepare('UPDATE triple_launches SET setup_signature=? WHERE id=? AND active=1').bind(sig,id).run();
+  else await db().prepare("UPDATE triple_launches SET signature=?,status='submitted' WHERE id=? AND active=1").bind(sig,id).run();
   try { await connection().sendRawTransaction(tx.serialize(),{skipPreflight:false,maxRetries:3}); }
   catch { return {id,signature:sig,status:'submitted',message:'Broadcast was not acknowledged. Its signature is tracked until finalization or expiry. You can retry the same signed transaction.'}; }
   return {id,signature:sig,status:'submitted'};

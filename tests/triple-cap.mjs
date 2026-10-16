@@ -1,0 +1,13 @@
+import assert from 'node:assert/strict';
+import {DatabaseSync} from 'node:sqlite';
+import path from 'node:path';
+import {createPrivateKey,sign} from 'node:crypto';
+import {Keypair} from '@solana/web3.js';
+const origin=process.env.TEST_ORIGIN||'http://127.0.0.1:4173',file=process.env.TEST_DB;
+if(!['localhost','127.0.0.1'].includes(new URL(origin).hostname)||!file||!path.resolve(file).startsWith(path.resolve('.wrangler/triple-state')+path.sep))throw Error('Requires the isolated localhost test DB.');
+const db=new DatabaseSync(file,{readOnly:true}),coin=db.prepare("SELECT mint FROM triple_launches WHERE status='finalized' AND slot>0 LIMIT 1").get();db.close();assert(coin);
+const user=Keypair.generate(),key=createPrivateKey({key:Buffer.concat([Buffer.from('302e020100300506032b657004220420','hex'),Buffer.from(user.secretKey.slice(0,32))]),format:'der',type:'pkcs8'});
+const payload=JSON.stringify({domain:origin,action:'Add Triple Pairs main coin',wallet:user.publicKey.toBase58(),mint:coin.mint,timestamp:Date.now(),nonce:crypto.randomUUID()});
+const r=await fetch(origin+'/api/groups',{method:'POST',headers:{Origin:origin,'Content-Type':'application/json'},body:JSON.stringify({payload,signature:sign(null,Buffer.from(payload),key).toString('base64')})});
+assert.equal(r.status,400);assert.match((await r.json()).error,/already belongs to a triple/);
+console.log('PASS: an existing paired coin cannot be imported as another main coin to bypass the three-position group. No RPC or broadcasts.');
